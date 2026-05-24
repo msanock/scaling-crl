@@ -16,7 +16,6 @@ import wandb_osh
 from brax import envs
 from brax.io import html
 from etils import epath
-from flax.linen.initializers import variance_scaling
 from flax.training.train_state import TrainState
 from wandb_osh.hooks import TriggerWandbSyncHook
 
@@ -34,11 +33,11 @@ class Args:
     torch_deterministic: bool = True
     cuda: bool = True
     track: bool = True
-    wandb_project_name: str = "clean_JaxGCRL_test"
-    wandb_entity: str = "wang-kevin3290-princeton-university"
-    wandb_mode: str = "offline"
-    wandb_dir: str = "."
-    wandb_group: str = "."
+    wandb_project_name: str = "jepa-crl"
+    wandb_entity: str = "msanock-msanocki"
+    wandb_mode: str = "online"
+    wandb_dir: str = "wandb_crl"
+    wandb_group: str = "crl"
     capture_vis: bool = True
     capture_vis_every_n_epochs: int = 1
     vis_length: int = 1000
@@ -94,6 +93,15 @@ class Args:
     # if K >= 2, sample K actions and take the one with the highest Q value
 
     use_jepa: int = 0
+
+    #jepa config
+    jepa_checkpoint_path: str = ""
+    jepa_continue_training: int = 1
+    jepa_use_predictor_representation: int = 0
+    stop_jepa_gradient: int = 1
+    sig_reg_knots: int = 7
+    sig_reg_weight: float = 0.09
+
 
     entropy_param: float = 0.5
     disable_entropy: int = 0
@@ -171,6 +179,7 @@ class TrainingState:
     actor_state: TrainState
     critic_state: TrainState
     alpha_state: TrainState
+    jepa_state: Any = None
 
 
 class Transition(NamedTuple):
@@ -190,9 +199,172 @@ def load_params(path: str):
 
 
 def save_params(path: str, params: Any):
-    """Saves parameters in flax format."""
     with epath.Path(path).open("wb") as fout:
         fout.write(pickle.dumps(params))
+
+
+
+def create_jepa_critic(args, action_size, sa_key, g_key):
+    from models.jepa_wm import JepaEncoder, JepaPredictor, JepaActionEmbedder, SA_encoderHead, JepaSAEncoder, SIGReg
+    from models.classic_encoders import G_encoder
+
+    jepa_encoder_key, jepa_predictor_key, sa_key = jax.random.split(sa_key, 3)
+
+    jepa_state_encoder = JepaEncoder(
+        network_width=args.critic_network_width,
+        network_depth=args.critic_depth,
+        skip_connections=args.critic_skip_connections,
+        use_relu=args.use_relu,
+    )
+    jepa_state_encoder_params = jepa_state_encoder.init(
+        jepa_encoder_key, np.ones([1, args.obs_dim])
+    )
+
+    jepa_action_embedder = JepaActionEmbedder(
+        network_width=args.critic_network_width,
+        network_depth=args.critic_depth,
+        skip_connections=args.critic_skip_connections,
+        use_relu=args.use_relu,
+    )
+    jepa_action_embedder_params = jepa_action_embedder.init(
+        jepa_encoder_key, np.ones([1, action_size])
+    )
+
+    jepa_predictor = JepaPredictor(
+        network_width=args.critic_network_width,
+        network_depth=args.critic_depth,
+        skip_connections=args.critic_skip_connections,
+        use_relu=args.use_relu,
+    )
+    jepa_predictor_params = jepa_predictor.init(
+        jepa_predictor_key, np.ones([1, 64]), np.ones([1, 64])
+    )
+
+    sa_encoder_head = SA_encoderHead(
+        network_width=args.critic_network_width,
+        network_depth=args.critic_depth,
+        skip_connections=args.critic_skip_connections,
+        use_relu=args.use_relu,
+    )
+
+    sa_encoder = JepaSAEncoder(
+        jepa_encoder=jepa_state_encoder,
+        sa_encoder_head=sa_encoder_head,
+        jepa_predictor=jepa_predictor,
+        jepa_action_embedder=jepa_action_embedder,
+        jepa_use_predictor_representation=bool(args.jepa_use_predictor_representation),
+        stop_jepa_gradient=bool(args.stop_jepa_gradient),
+    )
+
+    sa_encoder_params = sa_encoder.init(
+        sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size])
+    )
+
+    # Initialize SIGReg
+    sig_reg = SIGReg(
+        knots=args.sig_reg_knots,
+        num_proj=64,
+    )
+    sig_reg_key = jax.random.split(sa_key, 2)[1]
+    sig_reg_params = sig_reg.init({"params": sig_reg_key, "proj": sig_reg_key}, np.ones([1, 64]))
+
+    if args.jepa_continue_training:
+        if args.jepa_checkpoint_path != "":
+            loaded_params = load_params(args.jepa_checkpoint_path)[0]
+            if "action_embedder" not in loaded_params:
+                loaded_params = dict(loaded_params)
+                loaded_params["action_embedder"] = jepa_action_embedder_params
+            jepa_state = TrainState.create(
+                apply_fn=None,
+                params=flax.core.freeze(loaded_params),
+                tx=optax.adam(learning_rate=args.critic_lr),
+            )
+        else:
+            jepa_state = TrainState.create(
+                apply_fn=None,
+                params=flax.core.freeze({"encoder": jepa_state_encoder_params, "predictor": jepa_predictor_params, "action_embedder": jepa_action_embedder_params }),
+                tx=optax.adam(learning_rate=args.critic_lr),
+            )
+    else:
+        if not args.jepa_checkpoint_path:
+            raise ValueError("JEPA checkpoint path is required when jepa_continue_training is False")
+        
+        loaded_params = load_params(args.jepa_checkpoint_path)[0]
+        if "action_embedder" not in loaded_params:
+            loaded_params = dict(loaded_params)
+            loaded_params["action_embedder"] = jepa_action_embedder_params
+        jepa_state = TrainState.create(
+            apply_fn=None,
+            params=flax.core.freeze(loaded_params), # index 0 is jepa_state params from train_jepa.py
+            tx=optax.set_to_zero(),
+        )
+
+    # Overwrite the initialized jepa_encoder parameters with the loaded/initialized jepa_state parameters
+    sa_encoder_params = flax.core.unfreeze(sa_encoder_params)
+    sa_encoder_params["jepa_encoder"] = jepa_state.params["encoder"]
+    if args.jepa_use_predictor_representation:
+        sa_encoder_params["jepa_predictor"] = jepa_state.params["predictor"]
+        sa_encoder_params["jepa_action_embedder"] = jepa_state.params["action_embedder"]
+    sa_encoder_params = flax.core.freeze(sa_encoder_params)
+
+    g_encoder = G_encoder(
+        network_width=args.critic_network_width,
+        network_depth=args.critic_depth,
+        skip_connections=args.critic_skip_connections,
+        use_relu=args.use_relu,
+    )
+    g_encoder_params = g_encoder.init(
+        g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx])
+    )
+
+    critic_state = TrainState.create(
+        apply_fn=None,
+        params=flax.core.freeze({"sa_encoder": sa_encoder_params, "g_encoder": g_encoder_params}),
+        tx=optax.adam(learning_rate=args.critic_lr),
+    )
+
+    return (
+        critic_state,
+        jepa_state,
+        sa_encoder,
+        g_encoder,
+        sig_reg,
+        sig_reg_params,
+        jepa_state_encoder,
+        jepa_predictor,
+        jepa_action_embedder,
+    )
+
+
+def create_classic_critic(args, action_size, sa_key, g_key):
+    from models.classic_encoders import G_encoder, SA_encoder
+
+    sa_encoder = SA_encoder(
+        network_width=args.critic_network_width,
+        network_depth=args.critic_depth,
+        skip_connections=args.critic_skip_connections,
+        use_relu=args.use_relu,
+    )
+    sa_encoder_params = sa_encoder.init(
+        sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size])
+    )
+    g_encoder = G_encoder(
+        network_width=args.critic_network_width,
+        network_depth=args.critic_depth,
+        skip_connections=args.critic_skip_connections,
+        use_relu=args.use_relu,
+    )
+    g_encoder_params = g_encoder.init(
+        g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx])
+    )
+
+    critic_state = TrainState.create(
+        apply_fn=None,
+        params=flax.core.freeze({"sa_encoder": sa_encoder_params, "g_encoder": g_encoder_params}),
+        tx=optax.adam(learning_rate=args.critic_lr),
+    )
+
+    return critic_state, sa_encoder, g_encoder
 
 
 if __name__ == "__main__":
@@ -251,7 +423,7 @@ if __name__ == "__main__":
             f"runs/{args.env_id}_{args.seed}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         )
         save_path = Path(args.wandb_dir) / Path(short_run_name)
-        os.mkdir(path=save_path)
+        os.makedirs(save_path, exist_ok=True)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -503,37 +675,29 @@ if __name__ == "__main__":
         tx=optax.adam(learning_rate=args.actor_lr),
     )
 
+    jepa_state = None
+    sig_reg = None
+    sig_reg_params = None
+    jepa_state_encoder = None
+    jepa_predictor = None
+    jepa_action_embedder = None
+
     # Critic
-    #
     if args.use_jepa:
-        raise NotImplementedError("JEPACritic is not implemented yet")
-
+        (
+            critic_state,
+            jepa_state,
+            sa_encoder,
+            g_encoder,
+            sig_reg,
+            sig_reg_params,
+            jepa_state_encoder,
+            jepa_predictor,
+            jepa_action_embedder,
+        ) = create_jepa_critic(args, action_size, sa_key, g_key)
     else:
-        from models.classic_encoders import G_encoder, SA_encoder
-
-        sa_encoder = SA_encoder(
-            network_width=args.critic_network_width,
-            network_depth=args.critic_depth,
-            skip_connections=args.critic_skip_connections,
-            use_relu=args.use_relu,
-        )
-        sa_encoder_params = sa_encoder.init(
-            sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size])
-        )
-        g_encoder = G_encoder(
-            network_width=args.critic_network_width,
-            network_depth=args.critic_depth,
-            skip_connections=args.critic_skip_connections,
-            use_relu=args.use_relu,
-        )
-        g_encoder_params = g_encoder.init(
-            g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx])
-        )
-
-        critic_state = TrainState.create(
-            apply_fn=None,
-            params={"sa_encoder": sa_encoder_params, "g_encoder": g_encoder_params},
-            tx=optax.adam(learning_rate=args.critic_lr),
+        critic_state, sa_encoder, g_encoder = create_classic_critic(
+            args, action_size, sa_key, g_key
         )
 
     # Entropy coefficient
@@ -554,6 +718,7 @@ if __name__ == "__main__":
         actor_state=actor_state,
         critic_state=critic_state,
         alpha_state=alpha_state,
+        jepa_state=jepa_state,
     )
 
     # Replay Buffer
@@ -807,7 +972,7 @@ if __name__ == "__main__":
 
         return training_state, metrics
 
-    # TODO: to other functions
+    
     @jax.jit
     def update_critic(transitions, training_state, key):
         critic_batch_size = args.batch_size
@@ -815,38 +980,8 @@ if __name__ == "__main__":
             lambda x: x[:critic_batch_size], transitions
         )
 
-        def critic_loss(critic_params, transitions, key):
-            sa_encoder_params, g_encoder_params = (
-                critic_params["sa_encoder"],
-                critic_params["g_encoder"],
-            )
-
-            obs = transitions.observation[:, : args.obs_dim]
-            action = transitions.action
-
-            sa_repr = sa_encoder.apply(sa_encoder_params, obs, action)
-            g_repr = g_encoder.apply(
-                g_encoder_params, transitions.observation[:, args.obs_dim :]
-            )
-
-            # InfoNCE
-            logits = -jnp.sqrt(
-                jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1)
-            )  # shape = BxB
-            critic_loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
-
-            # logsumexp regularisation
-            logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
-            critic_loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp**2)
-
-            I, correct, logits_pos, logits_neg = (
-                jnp.zeros(1),
-                jnp.zeros(1),
-                jnp.zeros(1),
-                jnp.zeros(1),
-            )
-
-            return critic_loss, (logsumexp, I, correct, logits_pos, logits_neg)
+        from models.classic_encoders import get_classic_critic_loss
+        critic_loss = get_classic_critic_loss(args, sa_encoder, g_encoder)
 
         (loss, (logsumexp, I, correct, logits_pos, logits_neg)), grad = (
             jax.value_and_grad(critic_loss, has_aux=True)(
@@ -855,6 +990,15 @@ if __name__ == "__main__":
         )
         new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
         training_state = training_state.replace(critic_state=new_critic_state)
+
+        if not args.stop_jepa_gradient and training_state.jepa_state is not None:
+            new_jepa_params = flax.core.unfreeze(training_state.jepa_state.params)
+            new_jepa_params["encoder"] = new_critic_state.params["sa_encoder"]["jepa_encoder"]
+            if args.jepa_use_predictor_representation:
+                new_jepa_params["predictor"] = new_critic_state.params["sa_encoder"]["jepa_predictor"]
+                new_jepa_params["action_embedder"] = new_critic_state.params["sa_encoder"]["jepa_action_embedder"]
+            new_jepa_state = training_state.jepa_state.replace(params=flax.core.freeze(new_jepa_params))
+            training_state = training_state.replace(jepa_state=new_jepa_state)
 
         metrics = {
             "categorical_accuracy": jnp.mean(correct),
@@ -866,6 +1010,45 @@ if __name__ == "__main__":
 
         return training_state, metrics
 
+    if args.use_jepa and args.jepa_continue_training:
+        @jax.jit
+        def update_jepa(transitions, training_state, key):
+            from models.jepa_wm import get_jepa_loss
+            jepa_loss_fn = get_jepa_loss(
+                args,
+                jepa_state_encoder,
+                jepa_predictor,
+                jepa_action_embedder,
+                sig_reg,
+                sig_reg_params,
+            )
+
+            (loss, metrics), grad = jax.value_and_grad(jepa_loss_fn, has_aux=True)(
+                training_state.jepa_state.params,
+                transitions,
+                key,
+            )
+            new_jepa_state = training_state.jepa_state.apply_gradients(grads=grad)
+            
+            # update critic state parameters
+            new_critic_params = flax.core.unfreeze(training_state.critic_state.params)
+            new_critic_params["sa_encoder"]["jepa_encoder"] = new_jepa_state.params["encoder"]
+            if args.jepa_use_predictor_representation:
+                new_critic_params["sa_encoder"]["jepa_predictor"] = new_jepa_state.params["predictor"]
+                new_critic_params["sa_encoder"]["jepa_action_embedder"] = new_jepa_state.params["action_embedder"]
+            new_critic_params = flax.core.freeze(new_critic_params)
+            new_critic_state = training_state.critic_state.replace(params=new_critic_params)
+
+            training_state = training_state.replace(
+                jepa_state=new_jepa_state,
+                critic_state=new_critic_state
+            )
+            return training_state, metrics
+    else:
+        @jax.jit
+        def update_jepa(transitions, training_state, key):
+            return training_state, {}
+
     @jax.jit
     def sgd_step(carry, transitions):
         training_state, key = carry
@@ -873,7 +1056,8 @@ if __name__ == "__main__":
             key,
             critic_key,
             actor_key,
-        ) = jax.random.split(key, 3)
+            jepa_key,
+        ) = jax.random.split(key, 4)
 
         training_state, actor_metrics = update_actor_and_alpha(
             transitions, training_state, actor_key
@@ -883,6 +1067,10 @@ if __name__ == "__main__":
             transitions, training_state, critic_key
         )
 
+        training_state, jepa_metrics = update_jepa(
+            transitions, training_state, jepa_key
+        )
+
         training_state = training_state.replace(
             gradient_steps=training_state.gradient_steps + 1
         )
@@ -890,6 +1078,7 @@ if __name__ == "__main__":
         metrics = {}
         metrics.update(actor_metrics)
         metrics.update(critic_metrics)
+        metrics.update(jepa_metrics)
 
         return (
             training_state,
@@ -1117,7 +1306,7 @@ if __name__ == "__main__":
                 print(f"Saved replay_buffer to {buffer_path}", flush=True)
             except Exception as e:
                 print(f"Error saving replay buffer after epoch {ne}: {e}", flush=True)
-        
+
         # render the policy after each epoch
         if args.capture_vis_every_n_epochs > 0 and ne % args.capture_vis_every_n_epochs == 0:
 

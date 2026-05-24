@@ -14,7 +14,7 @@ dependencies = [
     "jaxlib==0.4.23; platform_system != 'Linux'",
     "flax==0.7.4",
     "tyro",
-    "wandb==0.17.9",
+    "wandb>=0.27.0",
     "wandb-osh==1.2.2",
     "brax==0.10.1",
     "mediapy==1.2.2",
