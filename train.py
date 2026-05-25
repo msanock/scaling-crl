@@ -1311,7 +1311,7 @@ if __name__ == "__main__":
         if args.capture_vis_every_n_epochs > 0 and ne % args.capture_vis_every_n_epochs == 0:
 
             def render_policy(training_state, save_path):
-                """Renders the policy and saves it as an HTML file."""
+                """Renders the policy and saves it as an HTML file. Returns the html string."""
 
                 @jax.jit
                 def policy_step(env_state, actor_params):
@@ -1338,11 +1338,13 @@ if __name__ == "__main__":
                 render_path = f"{save_path}/vis_e{ne}.html"
                 with open(render_path, "w") as f:
                     f.write(html_string)
-                wandb.log({f"vis_e{ne}": wandb.Html(html_string)})
+                return html_string
 
             print("Rendering policy after epoch...", flush=True)
             try:
-                render_policy(training_state, save_path)
+                html_string = render_policy(training_state, save_path)
+                if args.track:
+                    metrics[f"vis_e{ne}"] = wandb.Html(html_string)
             except Exception as e:
                 print(f"Error rendering policy after epoch {ne}: {e}", flush=True)
 
@@ -1362,6 +1364,7 @@ if __name__ == "__main__":
 
             if args.wandb_mode == "offline":
                 trigger_sync()
+
 
         hours_passed = (time.time() - start_time) / 3600
         print(f"Time elapsed: {hours_passed:.3f} hours", flush=True)
