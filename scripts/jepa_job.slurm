@@ -5,7 +5,7 @@
 #SBATCH --nodelist steven
 #SBATCH --gres=gpu:titanv:1
 #SBATCH --mem-per-cpu=8G                 # Memory per CPU core
-#SBATCH --time 20:00:00                   # Time limit (hh:mm:ss)
+#SBATCH --time 15:00:00                   # Time limit (hh:mm:ss)
 #SBATCH --output=slurm_logs/slurm-%j.out       # Output file (%j = job ID)
 
 module purge
