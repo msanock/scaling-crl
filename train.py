@@ -39,7 +39,7 @@ class Args:
     wandb_dir: str = "wandb_crl"
     wandb_group: str = "crl"
     capture_vis: bool = True
-    capture_vis_every_n_epochs: int = 1
+    capture_vis_every_n_epochs: int = 2
     vis_length: int = 1000
     checkpoint: bool = True
 
@@ -1349,15 +1349,16 @@ if __name__ == "__main__":
                 print(f"Error rendering policy after epoch {ne}: {e}", flush=True)
 
         if args.checkpoint:
-            if ne < 5 or ne >= args.num_epochs - 5 or ne % 10 == 0:
+            if ne % 5 == 0 or ne >= args.num_epochs - 3:
                 # Save current policy and critic params.
                 params = (
                     training_state.alpha_state.params,
                     training_state.actor_state.params,
                     training_state.critic_state.params,
                 )
-                path = f"{save_path}/step_{int(training_state.env_steps)}.pkl"
+                path = f"{save_path}/step_{int(training_state.env_steps)}_ep{ne}.pkl"
                 save_params(path, params)
+                print(f"Saved params to {path}", flush=True)
 
         if args.track:
             wandb.log(metrics, step=ne)
