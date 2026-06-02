@@ -115,6 +115,29 @@ class JepaPredictor(nn.Module):
         x = nn.Dense(64, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         return x
 
+class JepaIDM(nn.Module):
+    """Inverse Dynamics Model: predicts a_t from (z_t, z_{t+1}).
+
+    L_IDM = ||a_t - IDM(z_t, z_{t+1})||^2  (Pathak et al. 2017)
+    Grounding consecutive embeddings in action space prevents the encoder
+    from collapsing or developing spurious correlations.
+    """
+    action_size: int
+    network_width: int = 128
+    use_relu: int = 0
+
+    @nn.compact
+    def __call__(self, z_t: jnp.ndarray, z_tp1: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.concatenate([z_t, z_tp1], axis=-1)  # (B, 2*D)
+        activation = nn.relu if self.use_relu else nn.swish
+        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom)(x)
+        x = activation(x)
+        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom)(x)
+        x = activation(x)
+        x = nn.Dense(self.action_size, kernel_init=lecun_unfirom)(x)
+        return x  # predicted action, NOT tanh-squashed (raw regression target)
+
+
 class SA_encoderHead(nn.Module):
     norm_type = "layer_norm"
     network_width: int = 1024
@@ -208,7 +231,56 @@ class SIGReg(nn.Module):
 
 
 
-def get_jepa_loss(args, jepa_encoder, jepa_predictor, jepa_action_embedder, sig_reg, sig_reg_params):
+def vicreg_loss(z: jnp.ndarray, gamma: float = 1.0, epsilon: float = 1e-4):
+    """VICReg variance + covariance regularisation.
+
+    Variance term: penalises per-dimension std < gamma, preventing collapse.
+    Covariance term: penalises off-diagonal of the feature covariance matrix,
+    encouraging each dimension to capture an independent factor of variation
+    (i.e. structural sparsity / concentrated PCA variance).
+
+    Args:
+        z: (B, D) encoder embeddings.
+        gamma: target minimum std per dimension (default 1.0).
+        epsilon: numerical stability for std computation.
+    Returns:
+        (var_loss, cov_loss) scalars.
+    """
+    B, D = z.shape
+    z = z - z.mean(axis=0, keepdims=True)  # centre
+    # Variance term
+    std = jnp.sqrt(z.var(axis=0) + epsilon)
+    var_loss = jnp.mean(jax.nn.relu(gamma - std))
+    # Covariance term
+    cov = (z.T @ z) / (B - 1)  # (D, D)
+    off_diag = cov - jnp.diag(jnp.diag(cov))
+    cov_loss = jnp.sum(jnp.square(off_diag)) / D
+    return var_loss, cov_loss
+
+
+def sim_loss(z_seq: jnp.ndarray) -> jnp.ndarray:
+    """Temporal similarity loss: encourages smooth latent trajectories.
+
+    L_sim = Σ_t ||z_t - z_{t+1}||^2  (averaged over t and batch).
+
+    Args:
+        z_seq: (T, B, D) sequence of embeddings (T >= 2).
+    Returns:
+        Scalar loss.
+    """
+    return jnp.mean(jnp.sum((z_seq[1:] - z_seq[:-1]) ** 2, axis=-1))
+
+
+def get_jepa_loss(
+    args,
+    jepa_encoder,
+    jepa_predictor,
+    jepa_action_embedder,
+    sig_reg,
+    sig_reg_params,
+    jepa_idm=None,
+    jepa_idm_params=None,
+):
     def jepa_loss(jepa_params, transitions, key):
         s_t = transitions.extras["state"]
         a_t = transitions.action
@@ -226,10 +298,147 @@ def get_jepa_loss(args, jepa_encoder, jepa_predictor, jepa_action_embedder, sig_
         z_tp1_target = jepa_encoder.apply(encoder_params, s_tp1)
 
         sig_reg_loss = sig_reg.apply(sig_reg_params, z_t, rngs={"proj": proj_key})
-        l2_loss = jnp.mean(jnp.sum((z_tp1_pred - z_tp1_target)**2, axis=-1))
-        loss = l2_loss + args.sig_reg_weight * sig_reg_loss
-        return loss, {"jepa_loss": loss, "jepa_l2_loss": l2_loss, "jepa_sig_reg_loss": sig_reg_loss}
+        l2_loss = jnp.mean(jnp.sum((z_tp1_pred - z_tp1_target) ** 2, axis=-1))
+
+        var_loss_weight = getattr(args, "var_loss_weight", 0.0)
+        cov_loss_weight = getattr(args, "cov_loss_weight", 0.0)
+        sim_loss_weight = getattr(args, "sim_loss_weight", 0.0)
+        idm_loss_weight = getattr(args, "idm_loss_weight", 0.0)
+
+        var_loss, cov_loss = vicreg_loss(z_t)
+
+        # Temporal similarity loss (single-step: just two embeddings)
+        z_seq_1step = jnp.stack([z_t, z_tp1_target], axis=0)  # (2, B, D)
+        sim_loss_val = sim_loss(z_seq_1step)
+
+        # IDM loss
+        if jepa_idm is not None and jepa_idm_params is not None and idm_loss_weight > 0.0:
+            a_pred = jepa_idm.apply(jepa_idm_params, z_t, z_tp1_target)
+            idm_loss_val = jnp.mean(jnp.sum((a_t - a_pred) ** 2, axis=-1))
+        else:
+            idm_loss_val = jnp.zeros(())
+
+        loss = (
+            l2_loss
+            + args.sig_reg_weight * sig_reg_loss
+            + var_loss_weight * var_loss
+            + cov_loss_weight * cov_loss
+            + sim_loss_weight * sim_loss_val
+            + idm_loss_weight * idm_loss_val
+        )
+        return loss, {
+            "jepa_loss": loss,
+            "jepa_l2_loss": l2_loss,
+            "jepa_sig_reg_loss": sig_reg_loss,
+            "jepa_var_loss": var_loss,
+            "jepa_cov_loss": cov_loss,
+            "jepa_sim_loss": sim_loss_val,
+            "jepa_idm_loss": idm_loss_val,
+        }
 
     return jepa_loss
 
 
+def get_multistep_jepa_loss(
+    args,
+    jepa_encoder,
+    jepa_predictor,
+    jepa_action_embedder,
+    sig_reg,
+    sig_reg_params,
+    jepa_idm=None,
+    jepa_idm_params=None,
+):
+    """Multi-step rollout loss for JEPA.
+
+    Expects windowed batches with shape:
+        states:  (B, K+1, D_obs)  — K+1 consecutive observations
+        actions: (B, K, D_act)    — K consecutive actions
+
+    Unrolls the predictor K steps propagating *predicted* embeddings forward:
+        L_pred = (1/K) Σ_{k=1..K} ||z_{t+k}^pred − z_{t+k}^target||^2
+        L_sim  = smooth-trajectory regulariser over all K+1 *target* embeddings
+        L_IDM  = (1/K) Σ_{k=0..K-1} ||a_{t+k} − IDM(z_{t+k}, z_{t+k+1})||^2
+    """
+    def jepa_loss(jepa_params, states, actions, key):
+        """
+        states:  (B, K+1, D_obs)
+        actions: (B, K, D_act)
+        """
+        proj_key = jax.random.split(key, 2)[1]
+        B, Kp1, D_obs = states.shape
+        K = actions.shape[1]
+
+        encoder_params = jepa_params["encoder"]
+        predictor_params = jepa_params["predictor"]
+        action_embedder_params = jepa_params["action_embedder"]
+
+        # Encode all K+1 states: reshape → encode → reshape back
+        z_targets = jepa_encoder.apply(
+            encoder_params, states.reshape(B * Kp1, D_obs)
+        ).reshape(B, Kp1, -1)  # (B, K+1, D_emb)
+        z_targets = jax.lax.stop_gradient(z_targets)
+        D_emb = z_targets.shape[-1]
+
+        # Multi-step rollout (Python loop, unrolled at trace time)
+        pred_losses = []
+        z_current = z_targets[:, 0, :]  # z_t, shape (B, D_emb)
+        for k in range(K):
+            a_k = actions[:, k, :]
+            a_emb_k = jepa_action_embedder.apply(action_embedder_params, a_k)
+            z_next_pred = jepa_predictor.apply(predictor_params, z_current, a_emb_k)
+            step_loss = jnp.mean(jnp.sum((z_next_pred - z_targets[:, k + 1, :]) ** 2, axis=-1))
+            pred_losses.append(step_loss)
+            z_current = z_next_pred  # propagate predicted embedding
+
+        l2_loss = jnp.mean(jnp.stack(pred_losses))
+
+        # SIGReg on z_t only
+        sig_reg_loss = sig_reg.apply(
+            sig_reg_params, z_targets[:, 0, :], rngs={"proj": proj_key}
+        )
+
+        # VICReg on all target embeddings flattened over time
+        z_flat = z_targets.reshape(B * Kp1, D_emb)
+        var_loss_weight = getattr(args, "var_loss_weight", 0.0)
+        cov_loss_weight = getattr(args, "cov_loss_weight", 0.0)
+        var_loss, cov_loss = vicreg_loss(z_flat)
+
+        # Temporal similarity loss over target embedding sequence
+        z_seq = jnp.transpose(z_targets, (1, 0, 2))  # (K+1, B, D_emb)
+        sim_loss_weight = getattr(args, "sim_loss_weight", 0.0)
+        sim_loss_val = sim_loss(z_seq)
+
+        # IDM loss over consecutive target pairs
+        idm_loss_weight = getattr(args, "idm_loss_weight", 0.0)
+        if jepa_idm is not None and jepa_idm_params is not None and idm_loss_weight > 0.0:
+            idm_step_losses = []
+            for k in range(K):
+                z_k   = z_targets[:, k, :]
+                z_kp1 = z_targets[:, k + 1, :]
+                a_k   = actions[:, k, :]
+                a_pred = jepa_idm.apply(jepa_idm_params, z_k, z_kp1)
+                idm_step_losses.append(jnp.mean(jnp.sum((a_k - a_pred) ** 2, axis=-1)))
+            idm_loss_val = jnp.mean(jnp.stack(idm_step_losses))
+        else:
+            idm_loss_val = jnp.zeros(())
+
+        loss = (
+            l2_loss
+            + args.sig_reg_weight * sig_reg_loss
+            + var_loss_weight * var_loss
+            + cov_loss_weight * cov_loss
+            + sim_loss_weight * sim_loss_val
+            + idm_loss_weight * idm_loss_val
+        )
+        return loss, {
+            "jepa_loss": loss,
+            "jepa_l2_loss": l2_loss,
+            "jepa_sig_reg_loss": sig_reg_loss,
+            "jepa_var_loss": var_loss,
+            "jepa_cov_loss": cov_loss,
+            "jepa_sim_loss": sim_loss_val,
+            "jepa_idm_loss": idm_loss_val,
+        }
+
+    return jepa_loss

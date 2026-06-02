@@ -95,6 +95,13 @@ def parse_args():
              "Enable this to only take the NEWEST buffer from each run "
              "(which already contains all prior data when the buffer is full).",
     )
+    p.add_argument(
+        "--sequential", action="store_true",
+        help="Save data in trajectory-sequential (env-major) order required for "
+             "multistep rollout training in train_jepa.py. Includes 'done' flags "
+             "for clean episode-boundary detection. Incompatible with --max_transitions "
+             "subsampling (which would break temporal ordering).",
+    )
     return p.parse_args()
 
 
@@ -167,6 +174,79 @@ def extract_transitions_from_buffer(pkl_path: str) -> tuple[np.ndarray, np.ndarr
     return s_t_out, a_t_out, s_tp1_out
 
 
+def extract_transitions_sequential(
+    pkl_path: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Load one replay buffer and return trajectory-sequential arrays.
+
+    The buffer's (T, E, 43) layout is already per-env-sequential (row t+1 is
+    the step after row t for each env). We expose this directly so that
+    train_jepa.py's multistep windowing can build valid K-step windows.
+
+    Episode boundaries are encoded in the returned `done` array (True where the
+    seed field flips between consecutive timesteps).
+
+    Returns:
+        s_t   : (E*T, 29)  current body-state observations, env-major order
+        a_t   : (E*T,  8)  actions
+        s_tp1 : (E*T, 29)  next body-state observations
+        done  : (E*T,)     bool — True at the LAST step of each episode
+
+    Layout of the flat output:
+        indices [0 .. T-1]       : env 0, steps 0..T-1
+        indices [T .. 2T-1]      : env 1, steps 0..T-1
+        ...
+    """
+    with open(pkl_path, "rb") as f:
+        buf = pickle.load(f)
+
+    bs         = buf["buffer_state"]
+    data       = np.array(bs.data)       # (T_max, E, 43)
+    insert_pos = int(bs.insert_position)
+
+    if insert_pos == 0:
+        print(f"  [WARN] {pkl_path}: insert_position=0, skipping", flush=True)
+        empty = np.zeros((0,), dtype=bool)
+        return (np.zeros((0, OBS_DIM_BODY)), np.zeros((0, ACTION_DIM)),
+                np.zeros((0, OBS_DIM_BODY)), empty)
+
+    valid = data[:insert_pos]             # (T, E, 43)
+    T, E, _ = valid.shape
+
+    obs     = valid[:, :, :OBS_DIM_BODY]           # (T, E, 29)
+    actions = valid[:, :, ACTION_START:ACTION_END] # (T, E, 8)
+    seed_t  = valid[:, :, 42]                      # (T, E)
+
+    # done[t, e] = True means episode ended at step t for env e
+    # (seed flips on the NEXT timestep, so done is detected as seed[t] != seed[t+1])
+    # For the last timestep we conservatively mark done=True (no next row to compare).
+    seed_flips = (seed_t[:-1] != seed_t[1:])       # (T-1, E)  True = boundary after t
+    done_te = np.concatenate(
+        [seed_flips, np.ones((1, E), dtype=bool)], axis=0
+    )  # (T, E) — last row of each env is always marked done
+
+    # Build s_tp1: for non-done steps use obs[t+1]; for done steps use obs[t]
+    # (the true next obs after a reset isn't in this buffer row; keeping obs[t]
+    #  avoids fabricating data — train_jepa.py will skip done transitions anyway)
+    obs_tp1 = np.concatenate([obs[1:], obs[-1:]], axis=0)  # (T, E, 29)
+    obs_tp1[done_te] = obs[done_te]  # mask out reset steps
+
+    # Transpose (T, E, D) → (E, T, D) → (E*T, D)
+    s_t_seq   = obs.transpose(1, 0, 2).reshape(-1, OBS_DIM_BODY)
+    a_t_seq   = actions.transpose(1, 0, 2).reshape(-1, ACTION_DIM)
+    s_tp1_seq = obs_tp1.transpose(1, 0, 2).reshape(-1, OBS_DIM_BODY)
+    done_seq  = done_te.T.reshape(-1)  # (E*T,)
+
+    valid_frac = 1.0 - done_seq.mean()
+    print(
+        f"  {os.path.basename(pkl_path)}: {T*E:>8,} steps "
+        f"({E} envs × {T} steps, {100*valid_frac:.1f}% non-terminal)",
+        flush=True,
+    )
+    return s_t_seq, a_t_seq, s_tp1_seq, done_seq
+
+
 def main():
     args = parse_args()
     rng  = np.random.default_rng(args.seed)
@@ -206,49 +286,136 @@ def main():
     print(f"\nProcessing {len(all_paths)} replay buffer file(s):", flush=True)
 
     # ── Extract transitions ───────────────────────────────────────────────
-    t0          = time.time()
-    s_t_parts   = []
-    a_t_parts   = []
-    s_tp1_parts = []
+    t0 = time.time()
 
-    for pkl_path in all_paths:
-        s_t, a_t, s_tp1 = extract_transitions_from_buffer(pkl_path)
-        s_t_parts.append(s_t)
-        a_t_parts.append(a_t)
-        s_tp1_parts.append(s_tp1)
+    if args.sequential:
+        # ── Trajectory-sequential mode (for multistep rollout training) ───
+        s_t_parts, a_t_parts, s_tp1_parts, done_parts = [], [], [], []
 
-    s_t   = np.concatenate(s_t_parts,   axis=0)
-    a_t   = np.concatenate(a_t_parts,   axis=0)
-    s_tp1 = np.concatenate(s_tp1_parts, axis=0)
+        for pkl_path in all_paths:
+            s_t, a_t, s_tp1, done = extract_transitions_sequential(pkl_path)
+            if len(s_t) == 0:
+                continue
+            s_t_parts.append(s_t)
+            a_t_parts.append(a_t)
+            s_tp1_parts.append(s_tp1)
+            done_parts.append(done)
 
-    print(f"\nTotal before subsampling: {len(s_t):,} transitions", flush=True)
+        # Concatenate buffers end-to-end.
+        # Mark the join point of each buffer chunk as done so windows never
+        # straddle two buffer files.
+        done_arrays = []
+        for d in done_parts:
+            d = d.copy()
+            d[-1] = True
+            done_arrays.append(d)
 
-    # ── Optional deduplication by unique (s_t, a_t) ──────────────────────
-    # (Consecutive full buffers overlap heavily; shuffling later is enough)
+        s_t   = np.concatenate(s_t_parts,   axis=0)
+        a_t   = np.concatenate(a_t_parts,   axis=0)
+        s_tp1 = np.concatenate(s_tp1_parts, axis=0)
+        done  = np.concatenate(done_arrays,  axis=0)
 
-    # ── Subsample ─────────────────────────────────────────────────────────
-    if args.max_transitions > 0 and len(s_t) > args.max_transitions:
-        idx   = rng.choice(len(s_t), size=args.max_transitions, replace=False)
-        s_t   = s_t[idx]
-        a_t   = a_t[idx]
-        s_tp1 = s_tp1[idx]
-        print(f"Subsampled to {len(s_t):,} transitions", flush=True)
+        print(
+            f"\nTotal (trajectory-sequential): {len(s_t):,} steps, "
+            f"{100*(1-done.mean()):.1f}% non-terminal",
+            flush=True,
+        )
 
-    # ── Shuffle ───────────────────────────────────────────────────────────
-    perm   = rng.permutation(len(s_t))
-    s_t    = s_t[perm]
-    a_t    = a_t[perm]
-    s_tp1  = s_tp1[perm]
+        # ── Episode-level subsampling ──────────────────────────────────────
+        # Step-level subsampling would break temporal runs, so we sample
+        # whole episodes instead.  Episodes are identified by done flags.
+        if args.max_transitions > 0 and len(s_t) > args.max_transitions:
+            print(
+                f"Subsampling to ~{args.max_transitions:,} steps via "
+                f"episode-level sampling (seed={args.seed})...",
+                flush=True,
+            )
+            ep_end   = np.where(done)[0]                              # last step idx of each ep
+            ep_start = np.concatenate([[0], ep_end[:-1] + 1])        # first step idx
+            ep_len   = ep_end - ep_start + 1                         # length of each ep
 
-    # ── Sanity check ──────────────────────────────────────────────────────
-    xy = s_t[:, :2]
-    print(f"\nXY coverage — x: [{xy[:,0].min():.2f}, {xy[:,0].max():.2f}]  "
-          f"y: [{xy[:,1].min():.2f}, {xy[:,1].max():.2f}]", flush=True)
-    print(f"Final shapes: s_t={s_t.shape}, a_t={a_t.shape}, s_tp1={s_tp1.shape}", flush=True)
+            # Greedy random selection: shuffle episodes, add until budget full
+            order = rng.permutation(len(ep_end))
+            selected, total_sel = [], 0
+            for i in order:
+                if total_sel >= args.max_transitions:
+                    break
+                selected.append(i)
+                total_sel += int(ep_len[i])
 
-    # ── Save ──────────────────────────────────────────────────────────────
-    os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
-    np.savez_compressed(args.output, s_t=s_t, a_t=a_t, s_tp1=s_tp1)
+            # Sort so output stays temporally ordered within each episode block
+            selected.sort()
+            idx = np.concatenate([
+                np.arange(ep_start[i], ep_end[i] + 1) for i in selected
+            ])
+            s_t   = s_t[idx]
+            a_t   = a_t[idx]
+            s_tp1 = s_tp1[idx]
+            done  = done[idx]
+            print(
+                f"After episode sampling: {len(s_t):,} steps "
+                f"({len(selected):,} episodes kept)",
+                flush=True,
+            )
+
+        xy = s_t[:, :2]
+        print(f"XY coverage — x: [{xy[:,0].min():.2f}, {xy[:,0].max():.2f}]  "
+              f"y: [{xy[:,1].min():.2f}, {xy[:,1].max():.2f}]", flush=True)
+        print(f"Final shapes: s_t={s_t.shape}, a_t={a_t.shape}, "
+              f"s_tp1={s_tp1.shape}, done={done.shape}", flush=True)
+
+        os.makedirs(
+            os.path.dirname(args.output) if os.path.dirname(args.output) else ".",
+            exist_ok=True,
+        )
+        np.savez_compressed(
+            args.output,
+            s_t=s_t,
+            a_t=a_t,
+            s_tp1=s_tp1,
+            done=done,
+        )
+
+
+    else:
+        # ── Standard flat-pairs mode (original behaviour) ─────────────────
+        s_t_parts, a_t_parts, s_tp1_parts = [], [], []
+
+        for pkl_path in all_paths:
+            s_t, a_t, s_tp1 = extract_transitions_from_buffer(pkl_path)
+            s_t_parts.append(s_t)
+            a_t_parts.append(a_t)
+            s_tp1_parts.append(s_tp1)
+
+        s_t   = np.concatenate(s_t_parts,   axis=0)
+        a_t   = np.concatenate(a_t_parts,   axis=0)
+        s_tp1 = np.concatenate(s_tp1_parts, axis=0)
+
+        print(f"\nTotal before subsampling: {len(s_t):,} transitions", flush=True)
+
+        if args.max_transitions > 0 and len(s_t) > args.max_transitions:
+            idx   = rng.choice(len(s_t), size=args.max_transitions, replace=False)
+            s_t   = s_t[idx]
+            a_t   = a_t[idx]
+            s_tp1 = s_tp1[idx]
+            print(f"Subsampled to {len(s_t):,} transitions", flush=True)
+
+        perm  = rng.permutation(len(s_t))
+        s_t   = s_t[perm]
+        a_t   = a_t[perm]
+        s_tp1 = s_tp1[perm]
+
+        xy = s_t[:, :2]
+        print(f"\nXY coverage — x: [{xy[:,0].min():.2f}, {xy[:,0].max():.2f}]  "
+              f"y: [{xy[:,1].min():.2f}, {xy[:,1].max():.2f}]", flush=True)
+        print(f"Final shapes: s_t={s_t.shape}, a_t={a_t.shape}, s_tp1={s_tp1.shape}",
+              flush=True)
+
+        os.makedirs(
+            os.path.dirname(args.output) if os.path.dirname(args.output) else ".",
+            exist_ok=True,
+        )
+        np.savez_compressed(args.output, s_t=s_t, a_t=a_t, s_tp1=s_tp1)
 
     size_mb = os.path.getsize(args.output) / (1024 ** 2)
     elapsed = time.time() - t0
