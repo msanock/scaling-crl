@@ -71,8 +71,8 @@ class Args:
 
     critic_network_width: int = 256
     actor_network_width: int = 256
-    actor_depth: int = 4
-    critic_depth: int = 4
+    actor_depth: int = 32
+    critic_depth: int = 16
     actor_skip_connections: int = 0  # 0 for no skip connections, >= 0 means the frequency of skip connections (every N layers)
     critic_skip_connections: int = 0  # 0 for no skip connections, >= 0 means the frequency of skip connections (every N layers)
 
@@ -99,20 +99,24 @@ class Args:
     jepa_continue_training: int = 1
     jepa_use_predictor_representation: int = 0
     jepa_gradient_scale: float = 0.01
-    offline_dataset_path: str = "transition_datasets/dataset_5M_seq.npz"
+    offline_dataset_path: str = "transition_datasets/dataset_5M.npz"
     offline_ratio_start: float = 0.8
     offline_ratio_end: float = 0.2
     offline_decay_epochs: int = 40
-    sig_reg_knots: int = 7
+    sig_reg_knots: int = 17
+    sig_reg_num_proj: int = 1024
     sig_reg_weight: float = 0.09
+    jepa_encoder_depth: int = 32
+    jepa_action_embedder_depth: int = 4
+    jepa_predictor_depth: int = 16
 
 
     entropy_param: float = 0.5
     disable_entropy: int = 0
     use_relu: int = 0
     num_render: int = 10
-    save_buffer: int = 1
-    save_buffer_every_n_epochs: int = 10
+    save_buffer: int = 0
+    save_buffer_every_n_epochs: int = 0
 
     # to be filled in runtime
     env_steps_per_actor_step: int = 0
@@ -216,7 +220,7 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
 
     jepa_state_encoder = JepaEncoder(
         network_width=args.critic_network_width,
-        network_depth=args.critic_depth,
+        network_depth=args.jepa_encoder_depth,
         skip_connections=args.critic_skip_connections,
         use_relu=args.use_relu,
     )
@@ -226,7 +230,7 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
 
     jepa_action_embedder = JepaActionEmbedder(
         network_width=args.critic_network_width,
-        network_depth=args.critic_depth,
+        network_depth=args.jepa_action_embedder_depth,
         skip_connections=args.critic_skip_connections,
         use_relu=args.use_relu,
     )
@@ -236,7 +240,7 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
 
     jepa_predictor = JepaPredictor(
         network_width=args.critic_network_width,
-        network_depth=args.critic_depth,
+        network_depth=args.jepa_predictor_depth,
         skip_connections=args.critic_skip_connections,
         use_relu=args.use_relu,
     )
@@ -267,10 +271,10 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
     # Initialize SIGReg
     sig_reg = SIGReg(
         knots=args.sig_reg_knots,
-        num_proj=64,
+        num_proj=args.sig_reg_num_proj,
     )
     sig_reg_key = jax.random.split(sa_key, 2)[1]
-    sig_reg_params = sig_reg.init({"params": sig_reg_key, "proj": sig_reg_key}, np.ones([1, 64]))
+    sig_reg_params = sig_reg.init({"params": sig_reg_key, "proj": sig_reg_key}, np.ones([1, args.sig_reg_num_proj]))
 
     if args.jepa_continue_training:
         if args.jepa_checkpoint_path != "":

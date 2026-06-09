@@ -44,12 +44,15 @@ class Args:
     obs_dim: int = 0      # Inferred from dataset if 0
     action_size: int = 0  # Inferred from dataset if 0
     jepa_network_width: int = 256
-    jepa_network_depth: int = 4
+    jepa_encoder_depth: int = 32
+    jepa_action_embedder_depth: int = 4
+    jepa_predictor_depth: int = 16
     jepa_skip_connections: int = 0
     use_relu: int = 0
     use_sig_reg: int = 1 # always used
-    sig_reg_knots: int = 7
-    sig_reg_weight: float = 0.01  # was 0.09 — lowered to prevent SIGReg from dominating
+    sig_reg_knots: int = 17
+    sig_reg_num_proj: int = 1024
+    sig_reg_weight: float = 0.09  # was 0.09 — lowered to prevent SIGReg from dominating
     # VICReg covariance/variance regularisation (Experiment 2)
     # var_loss_weight: penalises per-dim std < 1.0, preventing collapse
     # cov_loss_weight: penalises off-diagonal covariance → structural sparsity
@@ -215,19 +218,19 @@ if __name__ == "__main__":
     # JEPA Network Setup
     jepa_encoder = JepaEncoder(
         network_width=args.jepa_network_width,
-        network_depth=args.jepa_network_depth,
+        network_depth=args.jepa_encoder_depth,
         skip_connections=args.jepa_skip_connections,
         use_relu=args.use_relu,
     )
     jepa_action_embedder = JepaActionEmbedder(
         network_width=args.jepa_network_width,
-        network_depth=args.jepa_network_depth,
+        network_depth=args.jepa_action_embedder_depth,
         skip_connections=args.jepa_skip_connections,
         use_relu=args.use_relu,
     )
     jepa_predictor = JepaPredictor(
         network_width=args.jepa_network_width,
-        network_depth=args.jepa_network_depth,
+        network_depth=args.jepa_predictor_depth,
         skip_connections=args.jepa_skip_connections,
         use_relu=args.use_relu,
     )
@@ -235,7 +238,7 @@ if __name__ == "__main__":
     # SIGReg setup
     sig_reg = SIGReg(
         knots=args.sig_reg_knots,
-        num_proj=64,
+        num_proj=args.sig_reg_num_proj,
     )
     
     enc_key, embed_key, pred_key, sig_reg_key, idm_key = jax.random.split(jepa_key, 5)
