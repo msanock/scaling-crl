@@ -178,20 +178,16 @@ class JepaSAEncoder(nn.Module):
     jepa_predictor: nn.Module = None
     jepa_action_embedder: nn.Module = None
     jepa_use_predictor_representation: bool = False
-    stop_jepa_gradient: bool = True
+    jepa_gradient_scale: float = 0.01
 
     def __call__(self, s: jnp.ndarray, a: jnp.ndarray):
         z_s = self.jepa_encoder(s)
-        if self.stop_jepa_gradient:
-            z_s = jax.lax.stop_gradient(z_s)
+        z_s = z_s * self.jepa_gradient_scale + jax.lax.stop_gradient(z_s) * (1.0 - self.jepa_gradient_scale)
 
         if self.jepa_use_predictor_representation:
             a_embedded = self.jepa_action_embedder(a)
             z_s_next = self.jepa_predictor(z_s, a_embedded)
-            if self.stop_jepa_gradient:
-                x = jax.lax.stop_gradient(z_s_next)
-            else:
-                x = z_s_next
+            x = z_s_next * self.jepa_gradient_scale + jax.lax.stop_gradient(z_s_next) * (1.0 - self.jepa_gradient_scale)
         else:
             x = jnp.concatenate([z_s, a], axis=-1)
 
@@ -202,8 +198,8 @@ class JepaSAEncoder(nn.Module):
 # Copied from le-wm and translated to JAX
 class SIGReg(nn.Module):
     """Sketch Isotropic Gaussian Regularizer (single-GPU!)"""
-    knots: int = 7 # 17
-    num_proj: int = 64 # 1024
+    knots: int = 17 # 17
+    num_proj: int = 1024 # 1024
 
     def setup(self):
         t = jnp.linspace(0, 3, self.knots, dtype=jnp.float32)

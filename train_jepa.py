@@ -505,7 +505,7 @@ if __name__ == "__main__":
         print(f"epoch {ne} out of {args.num_epochs} complete. metrics: {log_metrics}", flush=True)
 
         if args.checkpoint:
-            if ne < 5 or ne >= args.num_epochs - 5 or ne % 10 == 0:
+            if ne+1 % 10 == 0:
                 params = (
                     training_state.jepa_state.params,
                 )
