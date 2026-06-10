@@ -172,26 +172,7 @@ class SA_encoderHead(nn.Module):
         return x
 
 
-class JepaSAEncoder(nn.Module):
-    jepa_encoder: nn.Module
-    sa_encoder_head: nn.Module
-    jepa_predictor: nn.Module = None
-    jepa_action_embedder: nn.Module = None
-    jepa_use_predictor_representation: bool = False
-    jepa_gradient_scale: float = 0.01
 
-    def __call__(self, s: jnp.ndarray, a: jnp.ndarray):
-        z_s = self.jepa_encoder(s)
-        z_s = z_s * self.jepa_gradient_scale + jax.lax.stop_gradient(z_s) * (1.0 - self.jepa_gradient_scale)
-
-        if self.jepa_use_predictor_representation:
-            a_embedded = self.jepa_action_embedder(a)
-            z_s_next = self.jepa_predictor(z_s, a_embedded)
-            x = z_s_next * self.jepa_gradient_scale + jax.lax.stop_gradient(z_s_next) * (1.0 - self.jepa_gradient_scale)
-        else:
-            x = jnp.concatenate([z_s, a], axis=-1)
-
-        return self.sa_encoder_head(x)
 
 
 

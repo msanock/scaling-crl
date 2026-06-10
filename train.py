@@ -72,7 +72,7 @@ class Args:
     critic_network_width: int = 256
     actor_network_width: int = 256
     actor_depth: int = 32
-    critic_depth: int = 16
+    critic_depth: int = 32
     actor_skip_connections: int = 0  # 0 for no skip connections, >= 0 means the frequency of skip connections (every N layers)
     critic_skip_connections: int = 0  # 0 for no skip connections, >= 0 means the frequency of skip connections (every N layers)
 
@@ -109,6 +109,7 @@ class Args:
     jepa_encoder_depth: int = 32
     jepa_action_embedder_depth: int = 4
     jepa_predictor_depth: int = 16
+    jepa_actor: int = 0
 
 
     entropy_param: float = 0.5
@@ -213,7 +214,7 @@ def save_params(path: str, params: Any):
 
 
 def create_jepa_critic(args, action_size, sa_key, g_key):
-    from models.jepa_wm import JepaEncoder, JepaPredictor, JepaActionEmbedder, SA_encoderHead, JepaSAEncoder, SIGReg
+    from models.jepa_wm import JepaEncoder, JepaPredictor, JepaActionEmbedder, SA_encoderHead, SIGReg
     from models.classic_encoders import G_encoder
 
     jepa_encoder_key, jepa_predictor_key, sa_key = jax.random.split(sa_key, 3)
@@ -248,24 +249,16 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
         jepa_predictor_key, np.ones([1, 64]), np.ones([1, 64])
     )
 
-    sa_encoder_head = SA_encoderHead(
+    sa_encoder = SA_encoderHead(
         network_width=args.critic_network_width,
         network_depth=args.critic_depth,
         skip_connections=args.critic_skip_connections,
         use_relu=args.use_relu,
     )
 
-    sa_encoder = JepaSAEncoder(
-        jepa_encoder=jepa_state_encoder,
-        sa_encoder_head=sa_encoder_head,
-        jepa_predictor=jepa_predictor,
-        jepa_action_embedder=jepa_action_embedder,
-        jepa_use_predictor_representation=bool(args.jepa_use_predictor_representation),
-        jepa_gradient_scale=float(args.jepa_gradient_scale),
-    )
-
+    sa_encoder_input_dim = 64 if args.jepa_use_predictor_representation else 64 + action_size
     sa_encoder_params = sa_encoder.init(
-        sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size])
+        sa_key, np.ones([1, sa_encoder_input_dim])
     )
 
     # Initialize SIGReg
@@ -306,14 +299,6 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
             params=flax.core.freeze(loaded_params), # index 0 is jepa_state params from train_jepa.py
             tx=optax.set_to_zero(),
         )
-
-    # Overwrite the initialized jepa_encoder parameters with the loaded/initialized jepa_state parameters
-    sa_encoder_params = flax.core.unfreeze(sa_encoder_params)
-    sa_encoder_params["jepa_encoder"] = jepa_state.params["encoder"]
-    if args.jepa_use_predictor_representation:
-        sa_encoder_params["jepa_predictor"] = jepa_state.params["predictor"]
-        sa_encoder_params["jepa_action_embedder"] = jepa_state.params["action_embedder"]
-    sa_encoder_params = flax.core.freeze(sa_encoder_params)
 
     g_encoder = G_encoder(
         network_width=args.critic_network_width,
@@ -691,9 +676,10 @@ if __name__ == "__main__":
         skip_connections=args.actor_skip_connections,
         use_relu=args.use_relu,
     )
+    actor_input_dim = 64 + (args.goal_end_idx - args.goal_start_idx) if args.jepa_actor else obs_size
     actor_state = TrainState.create(
         apply_fn=actor.apply,
-        params=actor.init(actor_key, np.ones([1, obs_size])),
+        params=actor.init(actor_key, np.ones([1, actor_input_dim])),
         tx=optax.adam(learning_rate=args.actor_lr),
     )
 
@@ -777,7 +763,15 @@ if __name__ == "__main__":
     buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
     def deterministic_actor_step(training_state, env, env_state, extra_fields):
-        means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
+        if args.jepa_actor:
+            encoded_state = jepa_state_encoder.apply(
+                training_state.jepa_state.params["encoder"],
+                env_state.obs[:, : args.obs_dim]
+            )
+            actor_input = jnp.concatenate((encoded_state, env_state.obs[:, args.obs_dim :]), axis=-1)
+        else:
+            actor_input = env_state.obs
+        means, _ = actor.apply(training_state.actor_state.params, actor_input)
         actions = nn.tanh(means)
 
         nstate = env.step(env_state, actions)
@@ -792,7 +786,16 @@ if __name__ == "__main__":
         )
 
     def actor_step(training_state, env, env_state, key, extra_fields):
-        means, log_stds = actor.apply(training_state.actor_state.params, env_state.obs)
+        if args.jepa_actor:
+            encoded_state = jepa_state_encoder.apply(
+                training_state.jepa_state.params["encoder"],
+                env_state.obs[:, : args.obs_dim]
+            )
+            actor_input = jnp.concatenate((encoded_state, env_state.obs[:, args.obs_dim :]), axis=-1)
+        else:
+            actor_input = env_state.obs
+            
+        means, log_stds = actor.apply(training_state.actor_state.params, actor_input)
         stds = jnp.exp(log_stds)
         actions = nn.tanh(
             means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
@@ -812,7 +815,17 @@ if __name__ == "__main__":
     def multi_sample_actor_step(training_state, env, env_state, key, K, extra_fields):
         # Get K sets of actions from the actor
         keys = jax.random.split(key, K)
-        means, log_stds = actor.apply(training_state.actor_state.params, env_state.obs)
+        
+        if args.jepa_actor:
+            encoded_state = jepa_state_encoder.apply(
+                training_state.jepa_state.params["encoder"],
+                env_state.obs[:, : args.obs_dim]
+            )
+            actor_input = jnp.concatenate((encoded_state, env_state.obs[:, args.obs_dim :]), axis=-1)
+        else:
+            actor_input = env_state.obs
+            
+        means, log_stds = actor.apply(training_state.actor_state.params, actor_input)
         stds = jnp.exp(log_stds)
 
         actions = jnp.stack(
@@ -922,16 +935,24 @@ if __name__ == "__main__":
             lambda x: x[:actor_batch_size], transitions
         )
 
-        def actor_loss(actor_params, critic_params, log_alpha, transitions, key):
+        def actor_loss(actor_params, critic_params, jepa_params, log_alpha, transitions, key):
             obs = (
                 transitions.observation
             )  # expected_shape = batch_size, obs_size + goal_size
             state = obs[:, : args.obs_dim]
             future_state = transitions.extras["future_state"]
             goal = future_state[:, args.goal_start_idx : args.goal_end_idx]
-            observation = jnp.concatenate([state, goal], axis=1)
+            
+            if args.jepa_actor:
+                encoded_state = jax.lax.stop_gradient(jepa_state_encoder.apply(
+                    jepa_params["encoder"],
+                    state
+                ))
+                actor_input = jnp.concatenate([encoded_state, goal], axis=1)
+            else:
+                actor_input = jnp.concatenate([state, goal], axis=1)
 
-            means, log_stds = actor.apply(actor_params, observation)
+            means, log_stds = actor.apply(actor_params, actor_input)
             stds = jnp.exp(log_stds)
             x_ts = means + stds * jax.random.normal(
                 key, shape=means.shape, dtype=means.dtype
@@ -946,7 +967,18 @@ if __name__ == "__main__":
                 critic_params["sa_encoder"],
                 critic_params["g_encoder"],
             )
-            sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
+            
+            if args.use_jepa:
+                z_s = jepa_state_encoder.apply(jepa_params["encoder"], state)
+                if args.jepa_use_predictor_representation:
+                    a_embed = jepa_action_embedder.apply(jepa_params["action_embedder"], action)
+                    x = jepa_predictor.apply(jepa_params["predictor"], z_s, a_embed)
+                else:
+                    x = jnp.concatenate([z_s, action], axis=-1)
+                sa_repr = sa_encoder.apply(sa_encoder_params, x)
+            else:
+                sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
+                
             g_repr = g_encoder.apply(g_encoder_params, goal)
 
             qf_pi = -jnp.sqrt(jnp.sum((sa_repr - g_repr) ** 2, axis=-1))
@@ -970,6 +1002,7 @@ if __name__ == "__main__":
         )(
             training_state.actor_state.params,
             training_state.critic_state.params,
+            training_state.jepa_state.params if args.use_jepa else None,
             training_state.alpha_state.params["log_alpha"],
             transitions,
             key,
@@ -1002,47 +1035,54 @@ if __name__ == "__main__":
             lambda x: x[:critic_batch_size], transitions
         )
 
-        from models.classic_encoders import get_classic_critic_loss
-        critic_loss = get_classic_critic_loss(args, sa_encoder, g_encoder)
+        if args.use_jepa:
+            def critic_loss(critic_params, jepa_params, transitions, key):
+                s = transitions.observation[:, : args.obs_dim]
+                a = transitions.action
+                
+                z_s = jepa_state_encoder.apply(jepa_params["encoder"], s)
+                if args.jepa_use_predictor_representation:
+                    a_embed = jepa_action_embedder.apply(jepa_params["action_embedder"], a)
+                    x = jepa_predictor.apply(jepa_params["predictor"], z_s, a_embed)
+                else:
+                    x = jnp.concatenate([z_s, a], axis=-1)
+                    
+                sa_repr = sa_encoder.apply(critic_params["sa_encoder"], x)
+                g_repr = g_encoder.apply(critic_params["g_encoder"], transitions.observation[:, args.obs_dim :])
+                
+                # InfoNCE
+                logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))
+                loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
+                
+                logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
+                loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp**2)
+                
+                I, correct, logits_pos, logits_neg = jnp.zeros(1), jnp.zeros(1), jnp.zeros(1), jnp.zeros(1)
+                return loss, (logsumexp, I, correct, logits_pos, logits_neg)
 
-        (loss, (logsumexp, I, correct, logits_pos, logits_neg)), grad = (
-            jax.value_and_grad(critic_loss, has_aux=True)(
-                training_state.critic_state.params, transitions, key
+            (loss, (logsumexp, I, correct, logits_pos, logits_neg)), (critic_grad, jepa_grad) = jax.value_and_grad(critic_loss, argnums=(0, 1), has_aux=True)(
+                training_state.critic_state.params, training_state.jepa_state.params, transitions, key
             )
-        )
-        if args.jepa_gradient_scale > 0.0 and training_state.jepa_state is not None:
-            # Transfer JEPA gradients from critic grad to jepa grad, so JEPA optimizer handles them
-            grad = flax.core.unfreeze(grad)
-            jepa_grad = jax.tree_util.tree_map(jnp.zeros_like, training_state.jepa_state.params)
-            jepa_grad = flax.core.unfreeze(jepa_grad)
+            
+            if args.jepa_gradient_scale > 0.0:
+                jepa_grad = jax.tree_util.tree_map(lambda g: g * args.jepa_gradient_scale, jepa_grad)
+                new_jepa_state = training_state.jepa_state.apply_gradients(grads=jepa_grad)
+                training_state = training_state.replace(jepa_state=new_jepa_state)
 
-            jepa_grad["encoder"] = grad["sa_encoder"]["jepa_encoder"]
-            grad["sa_encoder"]["jepa_encoder"] = jax.tree_util.tree_map(jnp.zeros_like, grad["sa_encoder"]["jepa_encoder"])
+            new_critic_state = training_state.critic_state.apply_gradients(grads=critic_grad)
+            training_state = training_state.replace(critic_state=new_critic_state)
 
-            if args.jepa_use_predictor_representation:
-                jepa_grad["predictor"] = grad["sa_encoder"]["jepa_predictor"]
-                jepa_grad["action_embedder"] = grad["sa_encoder"]["jepa_action_embedder"]
-                grad["sa_encoder"]["jepa_predictor"] = jax.tree_util.tree_map(jnp.zeros_like, grad["sa_encoder"]["jepa_predictor"])
-                grad["sa_encoder"]["jepa_action_embedder"] = jax.tree_util.tree_map(jnp.zeros_like, grad["sa_encoder"]["jepa_action_embedder"])
-
-            grad = flax.core.freeze(grad)
-            jepa_grad = flax.core.freeze(jepa_grad)
-
-            new_jepa_state = training_state.jepa_state.apply_gradients(grads=jepa_grad)
-            training_state = training_state.replace(jepa_state=new_jepa_state)
-
-        new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
-        
-        if args.jepa_gradient_scale > 0.0 and training_state.jepa_state is not None:
-            # Sync the updated weights back to the critic state
-            new_critic_params = flax.core.unfreeze(new_critic_state.params)
-            new_critic_params["sa_encoder"]["jepa_encoder"] = new_jepa_state.params["encoder"]
-            if args.jepa_use_predictor_representation:
-                new_critic_params["sa_encoder"]["jepa_predictor"] = new_jepa_state.params["predictor"]
-                new_critic_params["sa_encoder"]["jepa_action_embedder"] = new_jepa_state.params["action_embedder"]
-            new_critic_state = new_critic_state.replace(params=flax.core.freeze(new_critic_params))
-
-        training_state = training_state.replace(critic_state=new_critic_state)
+        else:
+            from models.classic_encoders import get_classic_critic_loss
+            critic_loss = get_classic_critic_loss(args, sa_encoder, g_encoder)
+    
+            (loss, (logsumexp, I, correct, logits_pos, logits_neg)), grad = (
+                jax.value_and_grad(critic_loss, has_aux=True)(
+                    training_state.critic_state.params, transitions, key
+                )
+            )
+            new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
+            training_state = training_state.replace(critic_state=new_critic_state)
 
         metrics = {
             "categorical_accuracy": jnp.mean(correct),
@@ -1095,19 +1135,9 @@ if __name__ == "__main__":
                 key,
             )
             new_jepa_state = training_state.jepa_state.apply_gradients(grads=grad)
-            
-            # update critic state parameters
-            new_critic_params = flax.core.unfreeze(training_state.critic_state.params)
-            new_critic_params["sa_encoder"]["jepa_encoder"] = new_jepa_state.params["encoder"]
-            if args.jepa_use_predictor_representation:
-                new_critic_params["sa_encoder"]["jepa_predictor"] = new_jepa_state.params["predictor"]
-                new_critic_params["sa_encoder"]["jepa_action_embedder"] = new_jepa_state.params["action_embedder"]
-            new_critic_params = flax.core.freeze(new_critic_params)
-            new_critic_state = training_state.critic_state.replace(params=new_critic_params)
 
             training_state = training_state.replace(
-                jepa_state=new_jepa_state,
-                critic_state=new_critic_state
+                jepa_state=new_jepa_state
             )
             return training_state, metrics
     else:
@@ -1301,6 +1331,49 @@ if __name__ == "__main__":
         training_state, env_state, buffer_state, prefill_key
     )
 
+    def render_policy(training_state, save_path, epoch_num=None):
+        """Renders the policy and saves it as an HTML file. Returns the html string."""
+
+        @jax.jit
+        def policy_step(env_state, actor_params, jepa_params):
+            if args.jepa_actor:
+                encoded_state = jax.lax.stop_gradient(jepa_state_encoder.apply(
+                    jepa_params,
+                    env_state.obs[:, : args.obs_dim]
+                ))
+                actor_input = jnp.concatenate((encoded_state, env_state.obs[:, args.obs_dim :]), axis=-1)
+            else:
+                actor_input = env_state.obs
+
+            means, _ = actor.apply(actor_params, actor_input)
+            actions = nn.tanh(means)
+            next_state = env.step(env_state, actions)
+            return next_state, env_state
+
+        rollout_states = []
+        for i in range(args.num_render):
+            env = make_env(args.eval_env_id)
+
+            rng = jax.random.PRNGKey(seed=i + 1)
+            env_state = jax.jit(env.reset)(rng)
+
+            for _ in range(args.vis_length):
+                jepa_params = training_state.jepa_state.params["encoder"] if args.use_jepa else None
+                env_state, current_state = policy_step(
+                    env_state, 
+                    training_state.actor_state.params,
+                    jepa_params
+                )
+                rollout_states.append(current_state.pipeline_state)
+
+        # Render and save
+        html_string = html.render(env.sys, rollout_states)
+        file_name = f"vis_e{epoch_num}.html" if epoch_num is not None else "vis.html"
+        render_path = f"{save_path}/{file_name}"
+        with open(render_path, "w") as f:
+            f.write(html_string)
+        return html_string
+
     if args.eval_actor == 0:
         """Setting up evaluator"""
         evaluator = CrlEvaluator(
@@ -1405,44 +1478,14 @@ if __name__ == "__main__":
 
         # render the policy after each epoch
         if args.capture_vis_every_n_epochs > 0 and ne % args.capture_vis_every_n_epochs == 0:
-
-            def render_policy(training_state, save_path):
-                """Renders the policy and saves it as an HTML file. Returns the html string."""
-
-                @jax.jit
-                def policy_step(env_state, actor_params):
-                    means, _ = actor.apply(actor_params, env_state.obs)
-                    actions = nn.tanh(means)
-                    next_state = env.step(env_state, actions)
-                    return next_state, env_state
-
-                rollout_states = []
-                for i in range(args.num_render):
-                    env = make_env(args.eval_env_id)
-
-                    rng = jax.random.PRNGKey(seed=i + 1)
-                    env_state = jax.jit(env.reset)(rng)
-
-                    for _ in range(args.vis_length):
-                        env_state, current_state = policy_step(
-                            env_state, training_state.actor_state.params
-                        )
-                        rollout_states.append(current_state.pipeline_state)
-
-                # Render and save
-                html_string = html.render(env.sys, rollout_states)
-                render_path = f"{save_path}/vis_e{ne}.html"
-                with open(render_path, "w") as f:
-                    f.write(html_string)
-                return html_string
-
             print("Rendering policy after epoch...", flush=True)
             try:
-                html_string = render_policy(training_state, save_path)
+                html_string = render_policy(training_state, save_path, epoch_num=ne)
                 if args.track:
                     metrics[f"vis_e{ne}"] = wandb.Html(html_string)
             except Exception as e:
                 print(f"Error rendering policy after epoch {ne}: {e}", flush=True)
+
 
         if args.checkpoint:
             if ne % 5 == 0 or ne >= args.num_epochs - 3:
@@ -1478,40 +1521,10 @@ if __name__ == "__main__":
 
     # After training is complete, render the final policy
     if args.capture_vis:
-
-        def render_policy(training_state, save_path):
-            """Renders the policy and saves it as an HTML file."""
-
-            @jax.jit
-            def policy_step(env_state, actor_params):
-                means, _ = actor.apply(actor_params, env_state.obs)
-                actions = nn.tanh(means)
-                next_state = env.step(env_state, actions)
-                return next_state, env_state
-
-            rollout_states = []
-            for i in range(args.num_render):
-                env = make_env(args.eval_env_id)
-
-                rng = jax.random.PRNGKey(seed=i + 1)
-                env_state = jax.jit(env.reset)(rng)
-
-                for _ in range(args.vis_length):
-                    env_state, current_state = policy_step(
-                        env_state, training_state.actor_state.params
-                    )
-                    rollout_states.append(current_state.pipeline_state)
-
-            # Render and save
-            html_string = html.render(env.sys, rollout_states)
-            render_path = f"{save_path}/vis.html"
-            with open(render_path, "w") as f:
-                f.write(html_string)
-            wandb.log({"vis": wandb.Html(html_string)})
-
         print("Rendering final policy...", flush=True)
         try:
-            render_policy(training_state, save_path)
+            html_string = render_policy(training_state, save_path)
+            wandb.log({"vis": wandb.Html(html_string)})
         except Exception as e:
             print(f"Error rendering final policy: {e}", flush=True)
 
