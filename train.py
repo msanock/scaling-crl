@@ -98,7 +98,8 @@ class Args:
     jepa_checkpoint_path: str = ""
     jepa_continue_training: int = 1
     jepa_use_predictor_representation: int = 0
-    jepa_gradient_scale: float = 0.01
+    jepa_gradient_scale: float = 0.0
+    jepa_use_all_batches: int = 1
     offline_dataset_path: str = "transition_datasets/dataset_5M.npz"
     offline_ratio_start: float = 0.8
     offline_ratio_end: float = 0.2
@@ -1146,22 +1147,32 @@ if __name__ == "__main__":
             return training_state, {}
 
     @jax.jit
-    def sgd_step(carry, scan_data):
+    def jepa_sgd_step(carry, scan_data):
         training_state, key = carry
         transitions, offline_batch, offline_ratio = scan_data
+        key, jepa_key = jax.random.split(key)
+
+        training_state, jepa_metrics = update_jepa(
+            transitions, training_state, jepa_key, offline_batch, offline_ratio
+        )
+
+        return (
+            training_state,
+            key,
+        ), jepa_metrics
+
+    @jax.jit
+    def ac_sgd_step(carry, scan_data):
+        training_state, key = carry
+        transitions = scan_data
         (
             key,
             critic_key,
             actor_key,
-            jepa_key,
-        ) = jax.random.split(key, 4)
+        ) = jax.random.split(key, 3)
 
         training_state, actor_metrics = update_actor_and_alpha(
             transitions, training_state, actor_key
-        )
-
-        training_state, jepa_metrics = update_jepa(
-            transitions, training_state, jepa_key, offline_batch, offline_ratio
         )
 
         training_state, critic_metrics = update_critic(
@@ -1175,7 +1186,6 @@ if __name__ == "__main__":
         metrics = {}
         metrics.update(actor_metrics)
         metrics.update(critic_metrics)
-        metrics.update(jepa_metrics)
 
         return (
             training_state,
@@ -1246,36 +1256,48 @@ if __name__ == "__main__":
             transitions,
         )
 
+        transitions_ac = transitions
         if args.use_all_batches == 0:
-            num_total_batches = transitions.observation.shape[0]
+            num_total_batches = transitions_ac.observation.shape[0]
             selected_indices = jax.random.permutation(
                 sgd_batches_key, num_total_batches
             )[: args.num_sgd_batches_per_training_step]
-            transitions = jax.tree_util.tree_map(
-                lambda x: x[selected_indices], transitions
+            transitions_ac = jax.tree_util.tree_map(
+                lambda x: x[selected_indices], transitions_ac
             )
 
-        num_sgd_batches = transitions.observation.shape[0]
+        transitions_jepa = transitions if args.jepa_use_all_batches else transitions_ac
+
+        num_sgd_batches_jepa = transitions_jepa.observation.shape[0]
         if offline_s_t is not None:
             offline_idx = jax.random.randint(
                 offline_key,
-                shape=(num_sgd_batches, args.batch_size),
+                shape=(num_sgd_batches_jepa, args.batch_size),
                 minval=0,
                 maxval=offline_s_t.shape[0]
             )
-            offline_batches = (
+            offline_batches_jepa = (
                 offline_s_t[offline_idx],
                 offline_a_t[offline_idx],
                 offline_s_tp1[offline_idx]
             )
         else:
-            offline_batches = (
-                jnp.zeros((num_sgd_batches, args.batch_size, args.obs_dim)),
-                jnp.zeros((num_sgd_batches, args.batch_size, action_size)),
-                jnp.zeros((num_sgd_batches, args.batch_size, args.obs_dim))
+            offline_batches_jepa = (
+                jnp.zeros((num_sgd_batches_jepa, args.batch_size, args.obs_dim)),
+                jnp.zeros((num_sgd_batches_jepa, args.batch_size, action_size)),
+                jnp.zeros((num_sgd_batches_jepa, args.batch_size, args.obs_dim))
             )
         
-        offline_ratios = jnp.full((num_sgd_batches,), offline_ratio)
+        offline_ratios_jepa = jnp.full((num_sgd_batches_jepa,), offline_ratio)
+
+        # take jepa-step worth of training-step
+        (
+            (
+                training_state,
+                training_key,
+            ),
+            jepa_metrics,
+        ) = jax.lax.scan(jepa_sgd_step, (training_state, training_key), (transitions_jepa, offline_batches_jepa, offline_ratios_jepa))
 
         # take actor-step worth of training-step
         (
@@ -1283,8 +1305,12 @@ if __name__ == "__main__":
                 training_state,
                 _,
             ),
-            metrics,
-        ) = jax.lax.scan(sgd_step, (training_state, training_key), (transitions, offline_batches, offline_ratios))
+            ac_metrics,
+        ) = jax.lax.scan(ac_sgd_step, (training_state, training_key), transitions_ac)
+
+        metrics = {}
+        metrics.update(jepa_metrics)
+        metrics.update(ac_metrics)
 
         return (
             training_state,
