@@ -99,7 +99,7 @@ class Args:
     jepa_continue_training: int = 1
     jepa_use_predictor_representation: int = 0
     jepa_gradient_scale: float = 0.0
-    jepa_use_all_batches: int = 1
+    jepa_use_all_batches: int = 0
     offline_dataset_path: str = "transition_datasets/dataset_5M.npz"
     offline_ratio_start: float = 0.8
     offline_ratio_end: float = 0.2
@@ -107,6 +107,9 @@ class Args:
     sig_reg_knots: int = 17
     sig_reg_num_proj: int = 1024
     sig_reg_weight: float = 0.09
+    var_loss_weight: float = 0.0
+    cov_loss_weight: float = 0.0
+    sim_loss_weight: float = 0.0 
     jepa_encoder_depth: int = 32
     jepa_action_embedder_depth: int = 4
     jepa_predictor_depth: int = 16
@@ -257,7 +260,7 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
         use_relu=args.use_relu,
     )
 
-    sa_encoder_input_dim = 64 if args.jepa_use_predictor_representation else 64 + action_size
+    sa_encoder_input_dim = 128 if args.jepa_use_predictor_representation else 64 + action_size
     sa_encoder_params = sa_encoder.init(
         sa_key, np.ones([1, sa_encoder_input_dim])
     )
@@ -677,7 +680,7 @@ if __name__ == "__main__":
         skip_connections=args.actor_skip_connections,
         use_relu=args.use_relu,
     )
-    actor_input_dim = 64 + (args.goal_end_idx - args.goal_start_idx) if args.jepa_actor else obs_size
+    actor_input_dim = 128 if args.jepa_actor else obs_size
     actor_state = TrainState.create(
         apply_fn=actor.apply,
         params=actor.init(actor_key, np.ones([1, actor_input_dim])),
@@ -769,7 +772,11 @@ if __name__ == "__main__":
                 training_state.jepa_state.params["encoder"],
                 env_state.obs[:, : args.obs_dim]
             )
-            actor_input = jnp.concatenate((encoded_state, env_state.obs[:, args.obs_dim :]), axis=-1)
+            goal_embed = g_encoder.apply(
+                training_state.critic_state.params["g_encoder"],
+                env_state.obs[:, args.obs_dim :]
+            )
+            actor_input = jnp.concatenate((encoded_state, goal_embed), axis=-1)
         else:
             actor_input = env_state.obs
         means, _ = actor.apply(training_state.actor_state.params, actor_input)
@@ -792,7 +799,11 @@ if __name__ == "__main__":
                 training_state.jepa_state.params["encoder"],
                 env_state.obs[:, : args.obs_dim]
             )
-            actor_input = jnp.concatenate((encoded_state, env_state.obs[:, args.obs_dim :]), axis=-1)
+            goal_embed = g_encoder.apply(
+                training_state.critic_state.params["g_encoder"],
+                env_state.obs[:, args.obs_dim :]
+            )
+            actor_input = jnp.concatenate((encoded_state, goal_embed), axis=-1)
         else:
             actor_input = env_state.obs
             
@@ -822,7 +833,11 @@ if __name__ == "__main__":
                 training_state.jepa_state.params["encoder"],
                 env_state.obs[:, : args.obs_dim]
             )
-            actor_input = jnp.concatenate((encoded_state, env_state.obs[:, args.obs_dim :]), axis=-1)
+            goal_embed = g_encoder.apply(
+                training_state.critic_state.params["g_encoder"],
+                env_state.obs[:, args.obs_dim :]
+            )
+            actor_input = jnp.concatenate((encoded_state, goal_embed), axis=-1)
         else:
             actor_input = env_state.obs
             
@@ -949,7 +964,12 @@ if __name__ == "__main__":
                     jepa_params["encoder"],
                     state
                 ))
-                actor_input = jnp.concatenate([encoded_state, goal], axis=1)
+                # TODO: Using g_encoder from critic, might be a bad idea
+                goal_embed = jax.lax.stop_gradient(g_encoder.apply(
+                    critic_params["g_encoder"],
+                    goal
+                ))
+                actor_input = jnp.concatenate([encoded_state, goal_embed], axis=1)
             else:
                 actor_input = jnp.concatenate([state, goal], axis=1)
 
@@ -973,9 +993,11 @@ if __name__ == "__main__":
                 z_s = jepa_state_encoder.apply(jepa_params["encoder"], state)
                 if args.jepa_use_predictor_representation:
                     a_embed = jepa_action_embedder.apply(jepa_params["action_embedder"], action)
-                    x = jepa_predictor.apply(jepa_params["predictor"], z_s, a_embed)
+                    z_s_tp1 = jepa_predictor.apply(jepa_params["predictor"], z_s, a_embed)
+                    x = jnp.concatenate([z_s, z_s_tp1], axis=-1)
                 else:
-                    x = jnp.concatenate([z_s, action], axis=-1)
+                    a_embed = jepa_action_embedder.apply(jepa_params["action_embedder"], action)
+                    x = jnp.concatenate([z_s, a_embed], axis=-1)
                 sa_repr = sa_encoder.apply(sa_encoder_params, x)
             else:
                 sa_repr = sa_encoder.apply(sa_encoder_params, state, action)
@@ -1044,9 +1066,11 @@ if __name__ == "__main__":
                 z_s = jepa_state_encoder.apply(jepa_params["encoder"], s)
                 if args.jepa_use_predictor_representation:
                     a_embed = jepa_action_embedder.apply(jepa_params["action_embedder"], a)
-                    x = jepa_predictor.apply(jepa_params["predictor"], z_s, a_embed)
+                    z_s_tp1 = jepa_predictor.apply(jepa_params["predictor"], z_s, a_embed)
+                    x = jnp.concatenate([z_s, z_s_tp1], axis=-1)
                 else:
-                    x = jnp.concatenate([z_s, a], axis=-1)
+                    a_embed = jepa_action_embedder.apply(jepa_params["action_embedder"], a)
+                    x = jnp.concatenate([z_s, a_embed], axis=-1)
                     
                 sa_repr = sa_encoder.apply(critic_params["sa_encoder"], x)
                 g_repr = g_encoder.apply(critic_params["g_encoder"], transitions.observation[:, args.obs_dim :])
@@ -1361,13 +1385,17 @@ if __name__ == "__main__":
         """Renders the policy and saves it as an HTML file. Returns the html string."""
 
         @jax.jit
-        def policy_step(env_state, actor_params, jepa_params):
+        def policy_step(env_state, actor_params, jepa_params, g_params):
             if args.jepa_actor:
                 encoded_state = jax.lax.stop_gradient(jepa_state_encoder.apply(
                     jepa_params,
                     env_state.obs[:, : args.obs_dim]
                 ))
-                actor_input = jnp.concatenate((encoded_state, env_state.obs[:, args.obs_dim :]), axis=-1)
+                goal_embed = g_encoder.apply(
+                    g_params,
+                    env_state.obs[:, args.obs_dim :]
+                )
+                actor_input = jnp.concatenate((encoded_state, goal_embed), axis=-1)
             else:
                 actor_input = env_state.obs
 
@@ -1385,10 +1413,12 @@ if __name__ == "__main__":
 
             for _ in range(args.vis_length):
                 jepa_params = training_state.jepa_state.params["encoder"] if args.use_jepa else None
+                g_params = training_state.critic_state.params["g_encoder"] if args.use_jepa else None
                 env_state, current_state = policy_step(
                     env_state, 
                     training_state.actor_state.params,
-                    jepa_params
+                    jepa_params,
+                    g_params
                 )
                 rollout_states.append(current_state.pipeline_state)
 
