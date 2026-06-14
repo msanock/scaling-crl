@@ -11,6 +11,7 @@ class SA_encoder(nn.Module):
     network_depth: int = 4
     skip_connections: int = 0
     use_relu: int = 0
+    output_dim: int = 64
 
     @nn.compact
     def __call__(self, s: jnp.ndarray, a: jnp.ndarray):
@@ -37,7 +38,7 @@ class SA_encoder(nn.Module):
         for i in range(self.network_depth // 4):
             x = residual_block(x, self.network_width, normalize, activation)
         # Final layer
-        x = nn.Dense(64, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = nn.Dense(self.output_dim, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         return x
 
 
@@ -47,6 +48,7 @@ class G_encoder(nn.Module):
     network_depth: int = 4
     skip_connections: int = 0
     use_relu: int = 0
+    output_dim: int = 64
 
     @nn.compact
     def __call__(self, g: jnp.ndarray):
@@ -73,7 +75,7 @@ class G_encoder(nn.Module):
         for i in range(self.network_depth // 4):
             x = residual_block(x, self.network_width, normalize, activation)
         # Final layer
-        x = nn.Dense(64, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = nn.Dense(self.output_dim, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         return x
 
 

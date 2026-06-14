@@ -73,6 +73,7 @@ class Args:
     actor_network_width: int = 256
     actor_depth: int = 32
     critic_depth: int = 32
+    final_embedding_dim: int = 64
     actor_skip_connections: int = 0  # 0 for no skip connections, >= 0 means the frequency of skip connections (every N layers)
     critic_skip_connections: int = 0  # 0 for no skip connections, >= 0 means the frequency of skip connections (every N layers)
 
@@ -99,6 +100,7 @@ class Args:
     jepa_continue_training: int = 1
     jepa_use_predictor_representation: int = 0
     jepa_gradient_scale: float = 0.0
+    jepa_lr: float = 5e-5
     jepa_use_all_batches: int = 0
     offline_dataset_path: str = "transition_datasets/dataset_5M.npz"
     offline_ratio_start: float = 0.8
@@ -113,6 +115,7 @@ class Args:
     jepa_encoder_depth: int = 32
     jepa_action_embedder_depth: int = 4
     jepa_predictor_depth: int = 16
+    jepa_embedding_dim: int = 64
     jepa_actor: int = 0
 
 
@@ -228,6 +231,7 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
         network_depth=args.jepa_encoder_depth,
         skip_connections=args.critic_skip_connections,
         use_relu=args.use_relu,
+        output_dim=args.jepa_embedding_dim,
     )
     jepa_state_encoder_params = jepa_state_encoder.init(
         jepa_encoder_key, np.ones([1, args.obs_dim])
@@ -238,6 +242,7 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
         network_depth=args.jepa_action_embedder_depth,
         skip_connections=args.critic_skip_connections,
         use_relu=args.use_relu,
+        output_dim=args.jepa_embedding_dim,
     )
     jepa_action_embedder_params = jepa_action_embedder.init(
         jepa_encoder_key, np.ones([1, action_size])
@@ -248,9 +253,10 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
         network_depth=args.jepa_predictor_depth,
         skip_connections=args.critic_skip_connections,
         use_relu=args.use_relu,
+        output_dim=args.jepa_embedding_dim,
     )
     jepa_predictor_params = jepa_predictor.init(
-        jepa_predictor_key, np.ones([1, 64]), np.ones([1, 64])
+        jepa_predictor_key, np.ones([1, args.jepa_embedding_dim]), np.ones([1, args.jepa_embedding_dim])
     )
 
     sa_encoder = SA_encoderHead(
@@ -258,9 +264,10 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
         network_depth=args.critic_depth,
         skip_connections=args.critic_skip_connections,
         use_relu=args.use_relu,
+        output_dim=args.final_embedding_dim,
     )
 
-    sa_encoder_input_dim = 128 if args.jepa_use_predictor_representation else 64 + action_size
+    sa_encoder_input_dim = args.jepa_embedding_dim * 2
     sa_encoder_params = sa_encoder.init(
         sa_key, np.ones([1, sa_encoder_input_dim])
     )
@@ -282,13 +289,13 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
             jepa_state = TrainState.create(
                 apply_fn=None,
                 params=flax.core.freeze(loaded_params),
-                tx=optax.adam(learning_rate=args.critic_lr),
+                tx=optax.adam(learning_rate=args.jepa_lr),
             )
         else:
             jepa_state = TrainState.create(
                 apply_fn=None,
                 params=flax.core.freeze({"encoder": jepa_state_encoder_params, "predictor": jepa_predictor_params, "action_embedder": jepa_action_embedder_params }),
-                tx=optax.adam(learning_rate=args.critic_lr),
+                tx=optax.adam(learning_rate=args.jepa_lr),
             )
     else:
         if not args.jepa_checkpoint_path:
@@ -309,6 +316,7 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
         network_depth=args.critic_depth,
         skip_connections=args.critic_skip_connections,
         use_relu=args.use_relu,
+        output_dim=args.final_embedding_dim,
     )
     g_encoder_params = g_encoder.init(
         g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx])
@@ -341,6 +349,7 @@ def create_classic_critic(args, action_size, sa_key, g_key):
         network_depth=args.critic_depth,
         skip_connections=args.critic_skip_connections,
         use_relu=args.use_relu,
+        output_dim=args.final_embedding_dim,
     )
     sa_encoder_params = sa_encoder.init(
         sa_key, np.ones([1, args.obs_dim]), np.ones([1, action_size])
@@ -350,6 +359,7 @@ def create_classic_critic(args, action_size, sa_key, g_key):
         network_depth=args.critic_depth,
         skip_connections=args.critic_skip_connections,
         use_relu=args.use_relu,
+        output_dim=args.final_embedding_dim,
     )
     g_encoder_params = g_encoder.init(
         g_key, np.ones([1, args.goal_end_idx - args.goal_start_idx])
@@ -680,7 +690,7 @@ if __name__ == "__main__":
         skip_connections=args.actor_skip_connections,
         use_relu=args.use_relu,
     )
-    actor_input_dim = 128 if args.jepa_actor else obs_size
+    actor_input_dim = args.jepa_embedding_dim + args.final_embedding_dim if args.jepa_actor else obs_size
     actor_state = TrainState.create(
         apply_fn=actor.apply,
         params=actor.init(actor_key, np.ones([1, actor_input_dim])),

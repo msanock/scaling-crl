@@ -10,6 +10,7 @@ class JepaEncoder(nn.Module):
     network_depth: int = 4
     skip_connections: int = 0
     use_relu: int = 0
+    output_dim: int = 64
 
     @nn.compact
     def __call__(self, s: jnp.ndarray):
@@ -36,7 +37,7 @@ class JepaEncoder(nn.Module):
         for i in range(self.network_depth // 4):
             x = residual_block(x, self.network_width, normalize, activation)
         # Final layer
-        x = nn.Dense(64, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = nn.Dense(self.output_dim, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         return x
 
 
@@ -46,6 +47,7 @@ class JepaActionEmbedder(nn.Module):
     network_depth: int = 4
     skip_connections: int = 0
     use_relu: int = 0
+    output_dim: int = 64
 
     @nn.compact
     def __call__(self, a: jnp.ndarray):
@@ -72,7 +74,7 @@ class JepaActionEmbedder(nn.Module):
         for i in range(self.network_depth // 4):
             x = residual_block(x, self.network_width, normalize, activation)
         # Final layer
-        x = nn.Dense(64, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = nn.Dense(self.output_dim, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         return x
 
 
@@ -85,6 +87,7 @@ class JepaPredictor(nn.Module):
     network_depth: int = 4
     skip_connections: int = 0
     use_relu: int = 0
+    output_dim: int = 64
 
     @nn.compact
     def __call__(self, prev_s_enc: jnp.ndarray, a_embedding: jnp.ndarray):
@@ -112,7 +115,7 @@ class JepaPredictor(nn.Module):
         for i in range(self.network_depth // 4):
             x = residual_block(x, self.network_width, normalize, activation)
         # Final layer
-        x = nn.Dense(64, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = nn.Dense(self.output_dim, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         return x
 
 class JepaIDM(nn.Module):
@@ -144,6 +147,7 @@ class SA_encoderHead(nn.Module):
     network_depth: int = 4
     skip_connections: int = 0
     use_relu: int = 0
+    output_dim: int = 64
 
     @nn.compact
     def __call__(self, x):
@@ -168,7 +172,7 @@ class SA_encoderHead(nn.Module):
         # Residual blocks
         for i in range(self.network_depth // 4):
             x = residual_block(x, self.network_width, normalize, activation)
-        x = nn.Dense(64, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = nn.Dense(self.output_dim, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         return x
 
 
@@ -255,8 +259,6 @@ def get_jepa_loss(
     jepa_action_embedder,
     sig_reg,
     sig_reg_params,
-    jepa_idm=None,
-    jepa_idm_params=None,
 ):
     def jepa_loss(jepa_params, transitions, key):
         s_t = transitions.extras["state"]
@@ -280,7 +282,6 @@ def get_jepa_loss(
         var_loss_weight = getattr(args, "var_loss_weight", 0.0)
         cov_loss_weight = getattr(args, "cov_loss_weight", 0.0)
         sim_loss_weight = getattr(args, "sim_loss_weight", 0.0)
-        idm_loss_weight = getattr(args, "idm_loss_weight", 0.0)
 
         var_loss, cov_loss = vicreg_loss(z_t)
 
@@ -288,20 +289,12 @@ def get_jepa_loss(
         z_seq_1step = jnp.stack([z_t, z_tp1_target], axis=0)  # (2, B, D)
         sim_loss_val = sim_loss(z_seq_1step)
 
-        # IDM loss
-        if jepa_idm is not None and jepa_idm_params is not None and idm_loss_weight > 0.0:
-            a_pred = jepa_idm.apply(jepa_idm_params, z_t, z_tp1_target)
-            idm_loss_val = jnp.mean(jnp.sum((a_t - a_pred) ** 2, axis=-1))
-        else:
-            idm_loss_val = jnp.zeros(())
-
         loss = (
             l2_loss
             + args.sig_reg_weight * sig_reg_loss
             + var_loss_weight * var_loss
             + cov_loss_weight * cov_loss
             + sim_loss_weight * sim_loss_val
-            + idm_loss_weight * idm_loss_val
         )
         return loss, {
             "jepa_loss": loss,
@@ -310,7 +303,6 @@ def get_jepa_loss(
             "jepa_var_loss": var_loss,
             "jepa_cov_loss": cov_loss,
             "jepa_sim_loss": sim_loss_val,
-            "jepa_idm_loss": idm_loss_val,
         }
 
     return jepa_loss
@@ -386,27 +378,12 @@ def get_multistep_jepa_loss(
         sim_loss_weight = getattr(args, "sim_loss_weight", 0.0)
         sim_loss_val = sim_loss(z_seq)
 
-        # IDM loss over consecutive target pairs
-        idm_loss_weight = getattr(args, "idm_loss_weight", 0.0)
-        if jepa_idm is not None and jepa_idm_params is not None and idm_loss_weight > 0.0:
-            idm_step_losses = []
-            for k in range(K):
-                z_k   = z_targets[:, k, :]
-                z_kp1 = z_targets[:, k + 1, :]
-                a_k   = actions[:, k, :]
-                a_pred = jepa_idm.apply(jepa_idm_params, z_k, z_kp1)
-                idm_step_losses.append(jnp.mean(jnp.sum((a_k - a_pred) ** 2, axis=-1)))
-            idm_loss_val = jnp.mean(jnp.stack(idm_step_losses))
-        else:
-            idm_loss_val = jnp.zeros(())
-
         loss = (
             l2_loss
             + args.sig_reg_weight * sig_reg_loss
             + var_loss_weight * var_loss
             + cov_loss_weight * cov_loss
             + sim_loss_weight * sim_loss_val
-            + idm_loss_weight * idm_loss_val
         )
         return loss, {
             "jepa_loss": loss,
@@ -415,7 +392,6 @@ def get_multistep_jepa_loss(
             "jepa_var_loss": var_loss,
             "jepa_cov_loss": cov_loss,
             "jepa_sim_loss": sim_loss_val,
-            "jepa_idm_loss": idm_loss_val,
         }
 
     return jepa_loss
