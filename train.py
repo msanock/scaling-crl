@@ -39,7 +39,6 @@ class Args:
     wandb_dir: str = "wandb_crl"
     wandb_group: str = "crl"
     capture_vis: bool = True
-    capture_vis_every_n_epochs: int = 2
     vis_length: int = 1000
     checkpoint: bool = True
 
@@ -72,7 +71,7 @@ class Args:
     critic_network_width: int = 256
     actor_network_width: int = 256
     actor_depth: int = 32
-    critic_depth: int = 32
+    critic_depth: int = 16
     final_embedding_dim: int = 64
     actor_skip_connections: int = 0  # 0 for no skip connections, >= 0 means the frequency of skip connections (every N layers)
     critic_skip_connections: int = 0  # 0 for no skip connections, >= 0 means the frequency of skip connections (every N layers)
@@ -100,8 +99,8 @@ class Args:
     jepa_continue_training: int = 1
     jepa_use_predictor_representation: int = 0
     jepa_concat_state_transition: int = 0
-    jepa_gradient_scale: float = 0.0
-    jepa_lr: float = 5e-5
+    jepa_gradient_scale: float = 0.01
+    jepa_lr: float = 3e-4  # old code used critic_lr for JEPA optimizer
     jepa_use_all_batches: int = 0
     offline_dataset_path: str = "transition_datasets/dataset_5M.npz"
     offline_ratio_start: float = 0.8
@@ -119,13 +118,14 @@ class Args:
     jepa_embedding_dim: int = 64
     jepa_actor: int = 0
 
-
     entropy_param: float = 0.5
     disable_entropy: int = 0
     use_relu: int = 0
     num_render: int = 10
     save_buffer: int = 0
     save_buffer_every_n_epochs: int = 0
+    capture_vis_every_n_epochs: int = 5
+
 
     # to be filled in runtime
     env_steps_per_actor_step: int = 0
@@ -998,17 +998,19 @@ if __name__ == "__main__":
             log_prob -= jnp.log((1 - jnp.square(action)) + 1e-6)
             log_prob = log_prob.sum(-1)  # dimension = B
 
-            # TODO: get_sa_repr and get_g_repr to other functions
             sa_encoder_params, g_encoder_params = (
                 critic_params["sa_encoder"],
                 critic_params["g_encoder"],
             )
             
             if args.use_jepa:
+                gs = args.jepa_gradient_scale
                 z_s = jepa_state_encoder.apply(jepa_params["encoder"], state)
+                z_s = z_s * gs + jax.lax.stop_gradient(z_s) * (1.0 - gs)
                 if args.jepa_use_predictor_representation:
                     a_embed = jepa_action_embedder.apply(jepa_params["action_embedder"], action)
                     z_s_tp1 = jepa_predictor.apply(jepa_params["predictor"], z_s, a_embed)
+                    z_s_tp1 = z_s_tp1 * gs + jax.lax.stop_gradient(z_s_tp1) * (1.0 - gs)
                     x = jnp.concatenate([z_s, z_s_tp1], axis=-1) if args.jepa_concat_state_transition else z_s_tp1
                 else:
                     a_embed = jepa_action_embedder.apply(jepa_params["action_embedder"], action)
@@ -1068,58 +1070,67 @@ if __name__ == "__main__":
     
     @jax.jit
     def update_critic(transitions, training_state, key):
-        critic_batch_size = args.batch_size
-        transitions = jax.tree_util.tree_map(
-            lambda x: x[:critic_batch_size], transitions
-        )
+        transitions = jax.tree_util.tree_map(lambda x: x[:args.batch_size], transitions)
 
         if args.use_jepa:
             def critic_loss(critic_params, jepa_params, transitions, key):
                 s = transitions.observation[:, : args.obs_dim]
                 a = transitions.action
-                
+                gs = args.jepa_gradient_scale
+
                 z_s = jepa_state_encoder.apply(jepa_params["encoder"], s)
+                z_s = z_s * gs + jax.lax.stop_gradient(z_s) * (1.0 - gs)
+
                 if args.jepa_use_predictor_representation:
                     a_embed = jepa_action_embedder.apply(jepa_params["action_embedder"], a)
                     z_s_tp1 = jepa_predictor.apply(jepa_params["predictor"], z_s, a_embed)
+                    z_s_tp1 = z_s_tp1 * gs + jax.lax.stop_gradient(z_s_tp1) * (1.0 - gs)
                     x = jnp.concatenate([z_s, z_s_tp1], axis=-1) if args.jepa_concat_state_transition else z_s_tp1
                 else:
                     a_embed = jepa_action_embedder.apply(jepa_params["action_embedder"], a)
+                    a_embed = a_embed * gs + jax.lax.stop_gradient(a_embed) * (1.0 - gs)
                     x = jnp.concatenate([z_s, a_embed], axis=-1)
-                    
+
                 sa_repr = sa_encoder.apply(critic_params["sa_encoder"], x)
-                g_repr = g_encoder.apply(critic_params["g_encoder"], transitions.observation[:, args.obs_dim :])
-                
+                g_repr = g_encoder.apply(
+                    critic_params["g_encoder"],
+                    transitions.extras["future_state"][:, args.goal_start_idx : args.goal_end_idx]
+                )
+
                 # InfoNCE
                 logits = -jnp.sqrt(jnp.sum((sa_repr[:, None, :] - g_repr[None, :, :]) ** 2, axis=-1))
                 loss = -jnp.mean(jnp.diag(logits) - jax.nn.logsumexp(logits, axis=1))
-                
-                logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
-                loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp**2)
-                
-                I, correct, logits_pos, logits_neg = jnp.zeros(1), jnp.zeros(1), jnp.zeros(1), jnp.zeros(1)
-                return loss, (logsumexp, I, correct, logits_pos, logits_neg)
 
-            (loss, (logsumexp, I, correct, logits_pos, logits_neg)), (critic_grad, jepa_grad) = jax.value_and_grad(critic_loss, argnums=(0, 1), has_aux=True)(
-                training_state.critic_state.params, training_state.jepa_state.params, transitions, key
-            )
-            
+                logsumexp = jax.nn.logsumexp(logits, axis=1)
+                loss += args.logsumexp_penalty_coeff * jnp.mean(logsumexp ** 2)
+
+                correct = jnp.argmax(logits, axis=1) == jnp.arange(len(logits))
+                mask = ~jnp.eye(len(logits), dtype=bool)
+                logits_neg = jnp.sum(logits * mask) / jnp.sum(mask)
+                return loss, (logsumexp, jnp.zeros(1), correct, jnp.diag(logits), logits_neg)
+
             if args.jepa_gradient_scale > 0.0:
-                jepa_grad = jax.tree_util.tree_map(lambda g: g * args.jepa_gradient_scale, jepa_grad)
+                (loss, aux), (critic_grad, jepa_grad) = jax.value_and_grad(
+                    critic_loss, argnums=(0, 1), has_aux=True
+                )(training_state.critic_state.params, training_state.jepa_state.params, transitions, key)
+                # No post-hoc scaling: forward-pass trick already scales gradients
+                # (encoder: gs*gs=0.0001, predictor/ae: gs=0.01)
                 new_jepa_state = training_state.jepa_state.apply_gradients(grads=jepa_grad)
                 training_state = training_state.replace(jepa_state=new_jepa_state)
+            else:
+                (loss, aux), critic_grad = jax.value_and_grad(
+                    critic_loss, has_aux=True
+                )(training_state.critic_state.params, training_state.jepa_state.params, transitions, key)
 
+            logsumexp, I, correct, logits_pos, logits_neg = aux
             new_critic_state = training_state.critic_state.apply_gradients(grads=critic_grad)
             training_state = training_state.replace(critic_state=new_critic_state)
-
         else:
             from models.classic_encoders import get_classic_critic_loss
-            critic_loss = get_classic_critic_loss(args, sa_encoder, g_encoder)
+            critic_loss_fn = get_classic_critic_loss(args, sa_encoder, g_encoder)
     
-            (loss, (logsumexp, I, correct, logits_pos, logits_neg)), grad = (
-                jax.value_and_grad(critic_loss, has_aux=True)(
-                    training_state.critic_state.params, transitions, key
-                )
+            (loss, (logsumexp, I, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(critic_loss_fn, has_aux=True)(
+                training_state.critic_state.params, transitions, key
             )
             new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
             training_state = training_state.replace(critic_state=new_critic_state)
@@ -1186,50 +1197,18 @@ if __name__ == "__main__":
             return training_state, {}
 
     @jax.jit
-    def jepa_sgd_step(carry, scan_data):
+    def sgd_step(carry, scan_data):
         training_state, key = carry
         transitions, offline_batch, offline_ratio = scan_data
-        key, jepa_key = jax.random.split(key)
+        key, critic_key, actor_key, jepa_key = jax.random.split(key, 4)
 
-        training_state, jepa_metrics = update_jepa(
-            transitions, training_state, jepa_key, offline_batch, offline_ratio
-        )
+        training_state, actor_metrics  = update_actor_and_alpha(transitions, training_state, actor_key)
+        training_state, jepa_metrics = update_jepa(transitions, training_state, jepa_key, offline_batch, offline_ratio)
+        training_state, critic_metrics = update_critic(transitions, training_state, critic_key)
 
-        return (
-            training_state,
-            key,
-        ), jepa_metrics
-
-    @jax.jit
-    def ac_sgd_step(carry, scan_data):
-        training_state, key = carry
-        transitions = scan_data
-        (
-            key,
-            critic_key,
-            actor_key,
-        ) = jax.random.split(key, 3)
-
-        training_state, actor_metrics = update_actor_and_alpha(
-            transitions, training_state, actor_key
-        )
-
-        training_state, critic_metrics = update_critic(
-            transitions, training_state, critic_key
-        )
-
-        training_state = training_state.replace(
-            gradient_steps=training_state.gradient_steps + 1
-        )
-
-        metrics = {}
-        metrics.update(actor_metrics)
-        metrics.update(critic_metrics)
-
-        return (
-            training_state,
-            key,
-        ), metrics
+        training_state = training_state.replace(gradient_steps=training_state.gradient_steps + 1)
+        metrics = {**jepa_metrics, **actor_metrics, **critic_metrics}
+        return (training_state, key), metrics
 
     @jax.jit
     def training_step(training_state, env_state, buffer_state, key, t, offline_ratio):
@@ -1295,61 +1274,41 @@ if __name__ == "__main__":
             transitions,
         )
 
-        transitions_ac = transitions
         if args.use_all_batches == 0:
-            num_total_batches = transitions_ac.observation.shape[0]
+            num_total_batches = transitions.observation.shape[0]
             selected_indices = jax.random.permutation(
                 sgd_batches_key, num_total_batches
             )[: args.num_sgd_batches_per_training_step]
-            transitions_ac = jax.tree_util.tree_map(
-                lambda x: x[selected_indices], transitions_ac
+            transitions = jax.tree_util.tree_map(
+                lambda x: x[selected_indices], transitions
             )
 
-        transitions_jepa = transitions if args.jepa_use_all_batches else transitions_ac
-
-        num_sgd_batches_jepa = transitions_jepa.observation.shape[0]
+        num_sgd_batches = transitions.observation.shape[0]
         if offline_s_t is not None:
             offline_idx = jax.random.randint(
                 offline_key,
-                shape=(num_sgd_batches_jepa, args.batch_size),
+                shape=(num_sgd_batches, args.batch_size),
                 minval=0,
                 maxval=offline_s_t.shape[0]
             )
-            offline_batches_jepa = (
+            offline_batches = (
                 offline_s_t[offline_idx],
                 offline_a_t[offline_idx],
                 offline_s_tp1[offline_idx]
             )
         else:
-            offline_batches_jepa = (
-                jnp.zeros((num_sgd_batches_jepa, args.batch_size, args.obs_dim)),
-                jnp.zeros((num_sgd_batches_jepa, args.batch_size, action_size)),
-                jnp.zeros((num_sgd_batches_jepa, args.batch_size, args.obs_dim))
+            offline_batches = (
+                jnp.zeros((num_sgd_batches, args.batch_size, args.obs_dim)),
+                jnp.zeros((num_sgd_batches, args.batch_size, action_size)),
+                jnp.zeros((num_sgd_batches, args.batch_size, args.obs_dim))
             )
         
-        offline_ratios_jepa = jnp.full((num_sgd_batches_jepa,), offline_ratio)
+        offline_ratios = jnp.full((num_sgd_batches,), offline_ratio)
 
-        # take jepa-step worth of training-step
         (
-            (
-                training_state,
-                training_key,
-            ),
-            jepa_metrics,
-        ) = jax.lax.scan(jepa_sgd_step, (training_state, training_key), (transitions_jepa, offline_batches_jepa, offline_ratios_jepa))
-
-        # take actor-step worth of training-step
-        (
-            (
-                training_state,
-                _,
-            ),
-            ac_metrics,
-        ) = jax.lax.scan(ac_sgd_step, (training_state, training_key), transitions_ac)
-
-        metrics = {}
-        metrics.update(jepa_metrics)
-        metrics.update(ac_metrics)
+            (training_state, _),
+            metrics,
+        ) = jax.lax.scan(sgd_step, (training_state, training_key), (transitions, offline_batches, offline_ratios))
 
         return (
             training_state,
