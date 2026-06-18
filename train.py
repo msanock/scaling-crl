@@ -276,12 +276,31 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
     sig_reg_key = jax.random.split(sa_key, 2)[1]
     sig_reg_params = sig_reg.init({"params": sig_reg_key, "proj": sig_reg_key}, np.ones([1, args.sig_reg_num_proj]))
 
+    def load_jepa_params(path):
+        checkpoint_data = load_params(path)
+        # Check if this is a train.py checkpoint: (alpha_params, actor_params, critic_params)
+        if isinstance(checkpoint_data, (tuple, list)) and len(checkpoint_data) == 3:
+            critic_params = checkpoint_data[2]
+            if "sa_encoder" in critic_params and "jepa_encoder" in critic_params["sa_encoder"]:
+                sa_enc = critic_params["sa_encoder"]
+                return {
+                    "encoder": sa_enc["jepa_encoder"],
+                    "predictor": sa_enc.get("jepa_predictor", jepa_predictor_params),
+                    "action_embedder": sa_enc.get("jepa_action_embedder", jepa_action_embedder_params),
+                }
+            else:
+                raise ValueError("Could not find JEPA parameters inside the critic state of the train.py checkpoint.")
+        
+        # Otherwise, assume it is a train_jepa.py checkpoint: (jepa_params,) or jepa_params directly
+        loaded = checkpoint_data[0] if isinstance(checkpoint_data, (tuple, list)) else checkpoint_data
+        loaded = dict(loaded)
+        if "action_embedder" not in loaded:
+            loaded["action_embedder"] = jepa_action_embedder_params
+        return loaded
+
     if args.jepa_continue_training:
         if args.jepa_checkpoint_path != "":
-            loaded_params = load_params(args.jepa_checkpoint_path)[0]
-            if "action_embedder" not in loaded_params:
-                loaded_params = dict(loaded_params)
-                loaded_params["action_embedder"] = jepa_action_embedder_params
+            loaded_params = load_jepa_params(args.jepa_checkpoint_path)
             jepa_state = TrainState.create(
                 apply_fn=None,
                 params=flax.core.freeze(loaded_params),
@@ -297,15 +316,13 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
         if not args.jepa_checkpoint_path:
             raise ValueError("JEPA checkpoint path is required when jepa_continue_training is False")
         
-        loaded_params = load_params(args.jepa_checkpoint_path)[0]
-        if "action_embedder" not in loaded_params:
-            loaded_params = dict(loaded_params)
-            loaded_params["action_embedder"] = jepa_action_embedder_params
+        loaded_params = load_jepa_params(args.jepa_checkpoint_path)
         jepa_state = TrainState.create(
             apply_fn=None,
             params=flax.core.freeze(loaded_params), # index 0 is jepa_state params from train_jepa.py
             tx=optax.set_to_zero(),
         )
+
 
     # Overwrite the initialized jepa_encoder parameters with the loaded/initialized jepa_state parameters
     sa_encoder_params = flax.core.unfreeze(sa_encoder_params)
