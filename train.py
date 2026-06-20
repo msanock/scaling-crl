@@ -220,6 +220,40 @@ def save_params(path: str, params: Any):
         fout.write(pickle.dumps(params))
 
 
+def extract_jepa_params(loaded):
+    # If it is a dictionary already
+    if isinstance(loaded, dict) and "encoder" in loaded:
+        return loaded
+    
+    # If it is a tuple/list
+    if isinstance(loaded, (tuple, list)):
+        # If length is 1, it's (jepa_params,) from train_jepa.py
+        if len(loaded) == 1:
+            return loaded[0]
+        
+        # If length is 4, it's (alpha, actor, critic, jepa) from train.py (new format)
+        if len(loaded) == 4:
+            return loaded[3]
+        
+        # If length is 3, it's (alpha, actor, critic) from train.py (old format)
+        if len(loaded) == 3:
+            critic_params = loaded[2]
+            if "sa_encoder" in critic_params:
+                sa_enc = critic_params["sa_encoder"]
+                # Try to extract the embedded jepa params
+                jepa_params = {}
+                if "jepa_encoder" in sa_enc:
+                    jepa_params["encoder"] = sa_enc["jepa_encoder"]
+                if "jepa_predictor" in sa_enc:
+                    jepa_params["predictor"] = sa_enc["jepa_predictor"]
+                if "jepa_action_embedder" in sa_enc:
+                    jepa_params["action_embedder"] = sa_enc["jepa_action_embedder"]
+                if jepa_params:
+                    return jepa_params
+            
+    raise ValueError(f"Could not find JEPA parameters in the loaded checkpoint of type {type(loaded)}.")
+
+
 
 def create_jepa_critic(args, action_size, sa_key, g_key):
     from models.jepa_wm import JepaEncoder, JepaPredictor, JepaActionEmbedder, SA_encoderHead, SIGReg
@@ -287,9 +321,14 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
 
     if args.jepa_continue_training:
         if args.jepa_checkpoint_path != "":
-            loaded_params = load_params(args.jepa_checkpoint_path)[0]
+            loaded = load_params(args.jepa_checkpoint_path)
+            loaded_params = extract_jepa_params(loaded)
+            loaded_params = dict(loaded_params)
+            if "encoder" not in loaded_params:
+                loaded_params["encoder"] = jepa_state_encoder_params
+            if "predictor" not in loaded_params:
+                loaded_params["predictor"] = jepa_predictor_params
             if "action_embedder" not in loaded_params:
-                loaded_params = dict(loaded_params)
                 loaded_params["action_embedder"] = jepa_action_embedder_params
             jepa_state = TrainState.create(
                 apply_fn=None,
@@ -306,13 +345,18 @@ def create_jepa_critic(args, action_size, sa_key, g_key):
         if not args.jepa_checkpoint_path:
             raise ValueError("JEPA checkpoint path is required when jepa_continue_training is False")
         
-        loaded_params = load_params(args.jepa_checkpoint_path)[0]
+        loaded = load_params(args.jepa_checkpoint_path)
+        loaded_params = extract_jepa_params(loaded)
+        loaded_params = dict(loaded_params)
+        if "encoder" not in loaded_params:
+            loaded_params["encoder"] = jepa_state_encoder_params
+        if "predictor" not in loaded_params:
+            loaded_params["predictor"] = jepa_predictor_params
         if "action_embedder" not in loaded_params:
-            loaded_params = dict(loaded_params)
             loaded_params["action_embedder"] = jepa_action_embedder_params
         jepa_state = TrainState.create(
             apply_fn=None,
-            params=flax.core.freeze(loaded_params), # index 0 is jepa_state params from train_jepa.py
+            params=flax.core.freeze(loaded_params),
             tx=optax.set_to_zero(),
         )
 
@@ -1520,11 +1564,19 @@ if __name__ == "__main__":
         if args.checkpoint:
             if ne % 5 == 0 or ne >= args.num_epochs - 3:
                 # Save current policy and critic params.
-                params = (
-                    training_state.alpha_state.params,
-                    training_state.actor_state.params,
-                    training_state.critic_state.params,
-                )
+                if training_state.jepa_state is not None:
+                    params = (
+                        training_state.alpha_state.params,
+                        training_state.actor_state.params,
+                        training_state.critic_state.params,
+                        training_state.jepa_state.params,
+                    )
+                else:
+                    params = (
+                        training_state.alpha_state.params,
+                        training_state.actor_state.params,
+                        training_state.critic_state.params,
+                    )
                 path = f"{save_path}/step_{int(training_state.env_steps)}_ep{ne}.pkl"
                 save_params(path, params)
                 print(f"Saved params to {path}", flush=True)
@@ -1541,11 +1593,19 @@ if __name__ == "__main__":
 
     if args.checkpoint:
         # Save current policy and critic params.
-        params = (
-            training_state.alpha_state.params,
-            training_state.actor_state.params,
-            training_state.critic_state.params,
-        )
+        if training_state.jepa_state is not None:
+            params = (
+                training_state.alpha_state.params,
+                training_state.actor_state.params,
+                training_state.critic_state.params,
+                training_state.jepa_state.params,
+            )
+        else:
+            params = (
+                training_state.alpha_state.params,
+                training_state.actor_state.params,
+                training_state.critic_state.params,
+            )
         path = f"{save_path}/final.pkl"
         save_params(path, params)
 
