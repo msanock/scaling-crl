@@ -221,6 +221,7 @@ class TrajectoryUniformSamplingQueue():
                 "seed": jnp.squeeze(transition.extras["state_extras"]["seed"][:-1]),
             },
             "state": state,
+            "next_state": transition.observation[1:, : obs_dim],
             "future_state": future_state,
             "future_action": future_action,
         }

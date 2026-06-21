@@ -7,3 +7,6 @@ uv.lock
 ./envs/__pycache__/*
 *.venv/
 /runs/*
+/wandb_jepa_only
+/wandb_crl
+/transition_datasets
